@@ -24,16 +24,8 @@ from websocket import create_connection, WebSocket
 # ============================================================
 # 配置
 # ============================================================
+from config import PG_CONFIG, CDP_HOST
 
-PG_CONFIG = {
-    "host": "localhost",
-    "port": 5432,
-    "user": "postgres",
-    "password": "long123456",
-    "dbname": "wsj_new",
-}
-
-CDP_HOST = "http://localhost:9222"
 CHROME_WSJ_ARCHIVE = "https://www.wsj.com/news/archive"
 
 START_YEAR = 1997

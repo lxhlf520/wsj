@@ -35,14 +35,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ============================================================
 # 配置
 # ============================================================
-
-PG_CONFIG = {
-    "host": "localhost",
-    "port": 5432,
-    "user": "postgres",
-    "password": "long123456",
-    "dbname": "wsj_new",
-}
+from config import PG_CONFIG
 
 # GraphQL 端点
 GQL_ENDPOINT = "https://shared-data.dowjones.io/gateway/graphql"

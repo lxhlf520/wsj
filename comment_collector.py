@@ -29,14 +29,7 @@ import psycopg2
 # ============================================================
 # 配置
 # ============================================================
-
-PG_CONFIG = {
-    "host": "localhost",
-    "port": 5432,
-    "user": "postgres",
-    "password": "long123456",
-    "dbname": "wsj_new",
-}
+from config import PG_CONFIG
 
 # Spot.im APP API
 SPOTIM_BASE = "https://mobile-gw.spot.im"
