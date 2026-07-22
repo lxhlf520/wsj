@@ -1,0 +1,10 @@
+[project]
+name = "wsj-app"
+version = "0.1.0"
+description = "WSJ Wall Street Journal full data collector"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx[http2]>=0.27",
+    "psycopg2-binary>=2.9",
+    "websocket-client>=1.7",
+]
