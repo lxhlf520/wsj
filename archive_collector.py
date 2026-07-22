@@ -318,7 +318,7 @@ class CDPClient:
 def get_or_create_page() -> tuple[Optional[str], str]:
     """获取或创建 CDP 页面，返回 (ws_url, page_url)"""
     try:
-        r = httpx.get(f"{CDP_HOST}/json", timeout=5)
+        r = httpx.get(f"{CDP_HOST}/json/list", timeout=5)
         pages = r.json()
         for p in pages:
             url = p.get("url", "")

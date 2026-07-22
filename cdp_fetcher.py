@@ -231,7 +231,7 @@ def fetch_article_via_cdp(ws_url: str, article_url: str, timeout: int = 25) -> d
 def get_wsj_tab_ws_url() -> str | None:
     """获取模拟器 Chrome 中 WSJ Tab 的 WebSocket URL"""
     try:
-        r = httpx.get("http://localhost:9222/json", timeout=5)
+        r = httpx.get("http://localhost:9222/json/list", timeout=5)
         pages = r.json()
         for p in pages:
             if "wsj.com" in p.get("url", ""):
