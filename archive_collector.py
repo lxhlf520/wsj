@@ -408,6 +408,80 @@ def get_or_create_page() -> tuple[Optional[str], str]:
 # Phase 1: 采集文章 URL
 # ============================================================
 
+def detect_captcha(client: CDPClient) -> Optional[str]:
+    """检测页面是否出现机器人验证（滑块/Challenge/PerimeterX等）"""
+    check_js = """(() => {
+        const url = window.location.href || '';
+        const title = document.title || '';
+        // 检查URL（PerimeterX/Cloudflare/WAF challenge常见路径）
+        if (/challenge|captcha|cdn-cgi|\\bpx\\b|block|denied|forbidden/i.test(url) && !url.includes('/news/archive')) {
+            return 'challenge_url: ' + url;
+        }
+        // 检查页面标题
+        if (/robot\\s*check|security\\s*check|attention\\s*required|please\\s*verify|captcha|challenge/i.test(title)) {
+            return 'challenge_title: ' + title;
+        }
+        // 检查DOM中的验证相关元素
+        if (document.querySelector('#px-captcha, [id*="px-captcha"], [class*="px-captcha"], #cf-challenge-running, [class*="captcha-box"], [id*="captcha-"], iframe[src*="challenge"], iframe[src*="captcha"]')) {
+            return 'captcha_element_detected';
+        }
+        return null;
+    })()"""
+    try:
+        return client.evaluate(check_js, timeout=5)
+    except:
+        return None
+
+
+def wait_for_captcha_solved(client: CDPClient, target_url: str, max_wait: int = 600) -> bool:
+    """等待用户手动解决滑块验证。最多等 max_wait 秒。"""
+    log.warning("=" * 60)
+    log.warning("⚠️  检测到机器人验证页面（CAPTCHA/Challenge）")
+    log.warning("⚠️  请在 Chrome 浏览器窗口中手动完成滑块验证")
+    log.warning(f"⚠️  脚本将自动轮询检测验证状态（最多 {max_wait} 秒）")
+    log.warning("=" * 60)
+    # Windows 蜂鸣提示
+    try:
+        import winsound
+        for _ in range(5):
+            winsound.Beep(1200, 300)
+            time.sleep(0.4)
+    except:
+        # 非Windows环境用终端响铃
+        for _ in range(5):
+            print('\a', end='', flush=True)
+            time.sleep(0.4)
+
+    start = time.time()
+    poll_count = 0
+    while time.time() - start < max_wait:
+        poll_count += 1
+        time.sleep(3)
+        # 检查是否已回到正常页面
+        status_js = """(() => {
+            const url = window.location.href || '';
+            const nd = document.getElementById('__NEXT_DATA__');
+            if (url.includes('/news/archive') && nd) return 'solved';
+            // 还可能处于中间跳转态
+            if (url.includes('wsj.com')) return 'wsj_loading';
+            return 'still_challenge';
+        })()"""
+        try:
+            status = client.evaluate(status_js, timeout=5)
+        except:
+            status = 'still_challenge'
+        if status == 'solved':
+            log.info(f"✅ 验证已通过（轮询 {poll_count} 次），继续采集")
+            time.sleep(1)
+            return True
+        if poll_count % 10 == 0:
+            elapsed = int(time.time() - start)
+            log.info(f"  仍在等待验证...（已等待 {elapsed}s）")
+    log.error(f"⏰ 等待 {max_wait} 秒后仍未通过验证，脚本退出")
+    log.error("请手动验证后重跑脚本")
+    return False
+
+
 def collect_day_articles(client: CDPClient, year: int, month: int, day: int, retries: int = 3) -> list[dict]:
     """采集某一天的文章列表（等待页面加载完成 + 日期验证 + 重试）"""
     url = f"{CHROME_WSJ_ARCHIVE}/{year}/{month:02d}/{day:02d}"
@@ -441,6 +515,18 @@ def collect_day_articles(client: CDPClient, year: int, month: int, day: int, ret
 
         # 页面加载完成后，短暂等待确保 __NEXT_DATA__ 已渲染
         time.sleep(0.5)
+
+        # 检测是否触发机器人验证（滑块/CAPTCHA）
+        captcha = detect_captcha(client)
+        if captcha:
+            log.warning(f"🚨 Captcha detected at {date_str}: {captcha}")
+            solved = wait_for_captcha_solved(client, url, max_wait=600)
+            if not solved:
+                log.error("Captcha not solved, stopping entire collection (please rerun later)")
+                raise SystemExit(1)
+            # 验证通过后重新导航到目标页面
+            client.navigate_and_wait(url, timeout=20)
+            time.sleep(0.5)
 
         # 验证页面日期是否匹配目标日期
         page_date = client.evaluate(verify_js, timeout=10)
