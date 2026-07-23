@@ -377,23 +377,55 @@ def get_or_create_page() -> tuple[Optional[str], str]:
 # ============================================================
 
 def collect_day_articles(client: CDPClient, year: int, month: int, day: int, retries: int = 3) -> list[dict]:
-    """采集某一天的文章列表（带重试机制）"""
+    """采集某一天的文章列表（轮询等待页面加载完成，带重试）"""
     url = f"{CHROME_WSJ_ARCHIVE}/{year}/{month:02d}/{day:02d}"
     date_str = f"{year}-{month:02d}-{day:02d}"
+    # 用于验证 __NEXT_DATA__ 属于目标日期的 JS
+    # 提取 __NEXT_DATA__ 中第一篇文章的日期来判断页面是否已更新
+    verify_js = """(() => {
+        const el = document.getElementById('__NEXT_DATA__');
+        if (!el) return null;
+        try {
+            const nd = JSON.parse(el.textContent);
+            const arts = nd.props.pageProps.newsArchiveArticles;
+            if (!arts || arts.length === 0) return 'empty';
+            // 检查第一篇文章的时间戳是否匹配目标日期
+            const ts = arts[0].timestamp || '';
+            return ts.substring(0, 10);
+        } catch(e) { return null; }
+    })()"""
 
     for attempt in range(retries):
         client.navigate(url)
-        wait = 3.0 + attempt * 3.0  # 第1次3秒，第2次6秒，第3次9秒
-        time.sleep(wait)
 
-        # 从 __NEXT_DATA__ 提取
-        js = "document.getElementById('__NEXT_DATA__') ? document.getElementById('__NEXT_DATA__').textContent : null"
-        raw = client.evaluate(js, timeout=15)
+        # 轮询等待页面加载到目标日期（最多等 max_wait 秒）
+        max_wait = 8.0 + attempt * 4.0  # 第1次8秒，第2次12秒，第3次16秒
+        poll_interval = 1.0
+        elapsed = 0.0
+        raw = None
+
+        while elapsed < max_wait:
+            time.sleep(poll_interval)
+            elapsed += poll_interval
+
+            # 检查页面日期是否已更新
+            page_date = client.evaluate(verify_js, timeout=5)
+            if page_date == date_str:
+                # 页面已加载到目标日期，提取完整数据
+                js = "document.getElementById('__NEXT_DATA__') ? document.getElementById('__NEXT_DATA__').textContent : null"
+                raw = client.evaluate(js, timeout=15)
+                break
+            elif page_date == 'empty':
+                # 页面加载了但该日期没有文章
+                log.info(f"  {date_str}: 0 articles (empty archive day)")
+                return []
+            # page_date 为 null 或其他日期 → 继续等待
+
         if raw:
             try:
                 nd = json.loads(raw)
                 articles = nd["props"]["pageProps"].get("newsArchiveArticles", [])
-                log.info(f"  {date_str}: {len(articles)} articles")
+                log.info(f"  {date_str}: {len(articles)} articles (loaded in {elapsed:.0f}s)")
                 return articles
             except (json.JSONDecodeError, KeyError) as e:
                 log.warning(f"  Parse error for {date_str}: {e}")
@@ -402,9 +434,9 @@ def collect_day_articles(client: CDPClient, year: int, month: int, day: int, ret
                     continue
                 return []
         else:
-            log.warning(f"No __NEXT_DATA__ for {date_str} (attempt {attempt + 1}/{retries})")
+            log.warning(f"No __NEXT_DATA__ for {date_str} after {max_wait:.0f}s (attempt {attempt + 1}/{retries})")
             if attempt < retries - 1:
-                log.info(f"  Retry {attempt + 1}/{retries} for {date_str} (wait {wait:.0f}s)...")
+                log.info(f"  Retry {attempt + 1}/{retries} for {date_str}...")
                 continue
 
     log.warning(f"  Gave up on {date_str} after {retries} attempts")
