@@ -323,6 +323,37 @@ class CDPClient:
                 pass
         return None
 
+    def enable_page_events(self):
+        """启用 Page 域事件（loadEventFired 等）"""
+        self.send_and_wait("Page.enable", timeout=5)
+
+    def navigate_and_wait(self, url: str, timeout: int = 20) -> bool:
+        """导航到 URL 并等待页面加载完成（Page.loadEventFired）"""
+        cid = self._next_id()
+        msg = {"id": cid, "method": "Page.navigate", "params": {"url": url}}
+        self.ws.send(json.dumps(msg))
+        self.ws.settimeout(timeout)
+        start = time.time()
+        nav_done = False
+        while time.time() - start < timeout:
+            try:
+                raw = self.ws.recv()
+                resp = json.loads(raw)
+                # Page.navigate 的响应
+                if resp.get("id") == cid:
+                    nav_done = True
+                    if "errorText" in resp.get("result", {}):
+                        log.warning(f"Navigate error: {resp['result']['errorText']}")
+                        return False
+                    continue
+                # Page.loadEventFired 事件 → 页面加载完成
+                if resp.get("method") == "Page.loadEventFired":
+                    return True
+            except:
+                pass
+        # 超时：如果导航成功了但没收到 loadEvent，返回 True（降级为轮询）
+        return nav_done
+
     def navigate(self, url: str, timeout: int = 30) -> bool:
         result = self.send_and_wait("Page.navigate", {"url": url}, timeout=timeout)
         if result and "errorText" in result:
@@ -346,6 +377,7 @@ class CDPClient:
         except:
             pass
         self.ws = create_connection(ws_url, timeout=timeout)
+        self.enable_page_events()
 
     def close(self):
         try:
@@ -377,11 +409,10 @@ def get_or_create_page() -> tuple[Optional[str], str]:
 # ============================================================
 
 def collect_day_articles(client: CDPClient, year: int, month: int, day: int, retries: int = 3) -> list[dict]:
-    """采集某一天的文章列表（轮询等待页面加载完成，带重试）"""
+    """采集某一天的文章列表（等待页面加载完成 + 日期验证 + 重试）"""
     url = f"{CHROME_WSJ_ARCHIVE}/{year}/{month:02d}/{day:02d}"
     date_str = f"{year}-{month:02d}-{day:02d}"
     # 用于验证 __NEXT_DATA__ 属于目标日期的 JS
-    # 提取 __NEXT_DATA__ 中第一篇文章的日期来判断页面是否已更新
     verify_js = """(() => {
         const el = document.getElementById('__NEXT_DATA__');
         if (!el) return null;
@@ -389,55 +420,64 @@ def collect_day_articles(client: CDPClient, year: int, month: int, day: int, ret
             const nd = JSON.parse(el.textContent);
             const arts = nd.props.pageProps.newsArchiveArticles;
             if (!arts || arts.length === 0) return 'empty';
-            // 检查第一篇文章的时间戳是否匹配目标日期
             const ts = arts[0].timestamp || '';
             return ts.substring(0, 10);
         } catch(e) { return null; }
     })()"""
 
     for attempt in range(retries):
-        client.navigate(url)
-
-        # 轮询等待页面加载到目标日期（最多等 max_wait 秒）
-        max_wait = 8.0 + attempt * 4.0  # 第1次8秒，第2次12秒，第3次16秒
-        poll_interval = 1.0
-        elapsed = 0.0
-        raw = None
-
-        while elapsed < max_wait:
-            time.sleep(poll_interval)
-            elapsed += poll_interval
-
-            # 检查页面日期是否已更新
-            page_date = client.evaluate(verify_js, timeout=5)
-            if page_date == date_str:
-                # 页面已加载到目标日期，提取完整数据
-                js = "document.getElementById('__NEXT_DATA__') ? document.getElementById('__NEXT_DATA__').textContent : null"
-                raw = client.evaluate(js, timeout=15)
-                break
-            elif page_date == 'empty':
-                # 页面加载了但该日期没有文章
-                log.info(f"  {date_str}: 0 articles (empty archive day)")
-                return []
-            # page_date 为 null 或其他日期 → 继续等待
-
-        if raw:
-            try:
-                nd = json.loads(raw)
-                articles = nd["props"]["pageProps"].get("newsArchiveArticles", [])
-                log.info(f"  {date_str}: {len(articles)} articles (loaded in {elapsed:.0f}s)")
-                return articles
-            except (json.JSONDecodeError, KeyError) as e:
-                log.warning(f"  Parse error for {date_str}: {e}")
-                if attempt < retries - 1:
-                    log.info(f"  Retry {attempt + 1}/{retries} for {date_str}...")
-                    continue
-                return []
-        else:
-            log.warning(f"No __NEXT_DATA__ for {date_str} after {max_wait:.0f}s (attempt {attempt + 1}/{retries})")
+        # 导航并等待 Page.loadEventFired（最多20秒）
+        loaded = client.navigate_and_wait(url, timeout=20)
+        if not loaded:
+            log.warning(f"Navigate failed for {date_str} (attempt {attempt + 1}/{retries})")
             if attempt < retries - 1:
-                log.info(f"  Retry {attempt + 1}/{retries} for {date_str}...")
                 continue
+            return []
+
+        # 页面加载完成后，短暂等待确保 __NEXT_DATA__ 已渲染
+        time.sleep(0.5)
+
+        # 验证页面日期是否匹配目标日期
+        page_date = client.evaluate(verify_js, timeout=10)
+        if page_date == date_str:
+            # 日期匹配，提取完整数据
+            js = "document.getElementById('__NEXT_DATA__') ? document.getElementById('__NEXT_DATA__').textContent : null"
+            raw = client.evaluate(js, timeout=15)
+            if raw:
+                try:
+                    nd = json.loads(raw)
+                    articles = nd["props"]["pageProps"].get("newsArchiveArticles", [])
+                    log.info(f"  {date_str}: {len(articles)} articles")
+                    return articles
+                except (json.JSONDecodeError, KeyError) as e:
+                    log.warning(f"  Parse error for {date_str}: {e}")
+        elif page_date == 'empty':
+            log.info(f"  {date_str}: 0 articles (empty archive day)")
+            return []
+        else:
+            # 页面加载了但日期不匹配，可能是SSR延迟，轮询几次
+            for _poll in range(5):
+                time.sleep(1.0)
+                page_date = client.evaluate(verify_js, timeout=10)
+                if page_date == date_str:
+                    js = "document.getElementById('__NEXT_DATA__') ? document.getElementById('__NEXT_DATA__').textContent : null"
+                    raw = client.evaluate(js, timeout=15)
+                    if raw:
+                        try:
+                            nd = json.loads(raw)
+                            articles = nd["props"]["pageProps"].get("newsArchiveArticles", [])
+                            log.info(f"  {date_str}: {len(articles)} articles (after {_poll+1}s poll)")
+                            return articles
+                        except (json.JSONDecodeError, KeyError):
+                            pass
+                    break
+                elif page_date == 'empty':
+                    log.info(f"  {date_str}: 0 articles (empty archive day)")
+                    return []
+
+        log.warning(f"Date mismatch for {date_str}: got '{page_date}' (attempt {attempt + 1}/{retries})")
+        if attempt < retries - 1:
+            log.info(f"  Retry {attempt + 1}/{retries} for {date_str}...")
 
     log.warning(f"  Gave up on {date_str} after {retries} attempts")
     return []
@@ -459,6 +499,7 @@ def run_phase1(max_articles: int = None):
         return
 
     client = CDPClient(ws_url, timeout=30)
+    client.enable_page_events()  # 启用 Page 域事件（loadEventFired）
 
     total_days = 0
     total_articles = 0
@@ -688,6 +729,7 @@ def run_phase2(max_articles: int = None):
         return
 
     client = CDPClient(ws_url, timeout=30)
+    client.enable_page_events()
 
     done = 0
     failed = 0
