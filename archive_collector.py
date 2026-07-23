@@ -120,12 +120,34 @@ def clear_db():
     db.close()
 
 
+def ensure_db(db):
+    """检查数据库连接是否存活，若断开则重连"""
+    try:
+        db.cursor().execute("SELECT 1")
+        return db
+    except Exception:
+        log.warning("DB connection lost, reconnecting...")
+        try:
+            db.close()
+        except:
+            pass
+        new_db = get_db()
+        log.info("DB reconnected successfully")
+        return new_db
+
+
 def insert_articles(db, articles: list[dict]) -> int:
-    """批量插入文章 URL 到 Daily_Articles（使用 savepoint 隔离每条 insert 失败）"""
-    cur = db.cursor()
+    """批量插入文章 URL 到 Daily_Articles（使用 savepoint 隔离每条 insert 失败，支持自动重连）"""
+    try:
+        cur = db.cursor()
+    except Exception:
+        log.warning("DB connection lost before insert, reconnecting...")
+        raise  # 让调用方处理重连
+
     now = datetime.now(timezone.utc).isoformat()
     count = 0
     skipped_null = 0
+    db_broken = False
     for art in articles:
         url = art.get("articleUrl") or ""
         url = url.strip()
@@ -149,6 +171,10 @@ def insert_articles(db, articles: list[dict]) -> int:
         else:
             year = 0; month = 0; date_str = ""
 
+        # 如果连接已断，跳过后续（由调用方重连后重试）
+        if db_broken:
+            continue
+
         # 使用 savepoint 隔离每条 insert，防止一条失败导致整个事务中止
         try:
             cur.execute("SAVEPOINT sp_article")
@@ -162,6 +188,14 @@ def insert_articles(db, articles: list[dict]) -> int:
             cur.execute("RELEASE SAVEPOINT sp_article")
             if inserted > 0:
                 count += 1
+        except psycopg2.OperationalError as e:
+            # 连接断开类错误，标记 db_broken，剩余文章跳过
+            db_broken = True
+            log.warning(f"DB connection broken during insert: {str(e)[:80]}")
+            try:
+                cur.execute("ROLLBACK TO SAVEPOINT sp_article")
+            except:
+                pass
         except Exception as e:
             # 回滚到 savepoint，继续处理下一条
             try:
@@ -172,7 +206,12 @@ def insert_articles(db, articles: list[dict]) -> int:
 
     if skipped_null > 0:
         log.info(f"  Skipped {skipped_null} articles with null URL (videos/audio/etc)")
-    db.commit()
+    if db_broken:
+        log.warning(f"  DB broken during insert, {count} inserted before failure, remaining skipped")
+    try:
+        db.commit()
+    except Exception:
+        pass  # 连接已断，commit 会失败，由调用方处理
     cur.close()
     return count
 
@@ -337,28 +376,39 @@ def get_or_create_page() -> tuple[Optional[str], str]:
 # Phase 1: 采集文章 URL
 # ============================================================
 
-def collect_day_articles(client: CDPClient, year: int, month: int, day: int) -> list[dict]:
-    """采集某一天的文章列表"""
+def collect_day_articles(client: CDPClient, year: int, month: int, day: int, retries: int = 3) -> list[dict]:
+    """采集某一天的文章列表（带重试机制）"""
     url = f"{CHROME_WSJ_ARCHIVE}/{year}/{month:02d}/{day:02d}"
+    date_str = f"{year}-{month:02d}-{day:02d}"
 
-    client.navigate(url)
-    time.sleep(2.5)  # 等页面加载（__NEXT_DATA__ 是 SSR，很快就绪）
+    for attempt in range(retries):
+        client.navigate(url)
+        wait = 3.0 + attempt * 3.0  # 第1次3秒，第2次6秒，第3次9秒
+        time.sleep(wait)
 
-    # 从 __NEXT_DATA__ 提取
-    js = "document.getElementById('__NEXT_DATA__') ? document.getElementById('__NEXT_DATA__').textContent : null"
-    raw = client.evaluate(js, timeout=10)
-    if not raw:
-        log.warning(f"No __NEXT_DATA__ for {year}-{month:02d}-{day:02d}")
-        return []
+        # 从 __NEXT_DATA__ 提取
+        js = "document.getElementById('__NEXT_DATA__') ? document.getElementById('__NEXT_DATA__').textContent : null"
+        raw = client.evaluate(js, timeout=15)
+        if raw:
+            try:
+                nd = json.loads(raw)
+                articles = nd["props"]["pageProps"].get("newsArchiveArticles", [])
+                log.info(f"  {date_str}: {len(articles)} articles")
+                return articles
+            except (json.JSONDecodeError, KeyError) as e:
+                log.warning(f"  Parse error for {date_str}: {e}")
+                if attempt < retries - 1:
+                    log.info(f"  Retry {attempt + 1}/{retries} for {date_str}...")
+                    continue
+                return []
+        else:
+            log.warning(f"No __NEXT_DATA__ for {date_str} (attempt {attempt + 1}/{retries})")
+            if attempt < retries - 1:
+                log.info(f"  Retry {attempt + 1}/{retries} for {date_str} (wait {wait:.0f}s)...")
+                continue
 
-    try:
-        nd = json.loads(raw)
-        articles = nd["props"]["pageProps"].get("newsArchiveArticles", [])
-        log.info(f"  {year}-{month:02d}-{day:02d}: {len(articles)} articles")
-        return articles
-    except (json.JSONDecodeError, KeyError) as e:
-        log.warning(f"  Parse error for {year}-{month:02d}-{day:02d}: {e}")
-        return []
+    log.warning(f"  Gave up on {date_str} after {retries} attempts")
+    return []
 
 
 def run_phase1(max_articles: int = None):
@@ -423,12 +473,17 @@ def run_phase1(max_articles: int = None):
                 try:
                     articles = collect_day_articles(client, year, month, day)
                     if articles:
+                        db = ensure_db(db)
                         n = insert_articles(db, articles)
                         month_articles += n
                         total_articles += n
                         consecutive_errors = 0
                     else:
                         consecutive_errors += 1
+                except psycopg2.OperationalError as e:
+                    log.error(f"DB error on {year}-{month:02d}-{day:02d}: {e}")
+                    db = ensure_db(db)
+                    consecutive_errors += 1
                 except Exception as e:
                     log.error(f"Error on {year}-{month:02d}-{day:02d}: {e}")
                     consecutive_errors += 1
@@ -441,15 +496,21 @@ def run_phase1(max_articles: int = None):
                     log.info(f"Reached max_articles limit ({max_articles}), stopping Phase 1")
                     break
 
-                # 每10天提交一次进度
-                if day % 10 == 0:
-                    db.commit()
+                # 每5天提交一次进度
+                if day % 5 == 0:
+                    try:
+                        db = ensure_db(db)
+                        db.commit()
+                    except Exception as e:
+                        log.warning(f"Commit failed: {e}, reconnecting...")
+                        db = ensure_db(db)
                     log.info(f"  Progress: {year}-{month:02d} day {day}/{days_in_month}, "
                              f"total articles so far: {total_articles}")
 
                 time.sleep(DAY_PAGE_DELAY)
 
             # 标记该月已完成
+            db = ensure_db(db)
             set_progress(db, f"archive_month_{year}_{month:02d}", "done")
             log.info(f"Month {year}-{month:02d}: {month_articles} articles, "
                      f"running total: {total_articles} from {total_days} days")
@@ -463,7 +524,11 @@ def run_phase1(max_articles: int = None):
             break
 
     client.close()
-    db.close()
+    try:
+        db = ensure_db(db)
+        db.close()
+    except:
+        pass
 
     log.info(f"\nPhase 1 complete: {total_articles} articles from {total_days} days "
              f"({skipped_days} days skipped)")
@@ -731,7 +796,11 @@ def run_phase2(max_articles: int = None):
 
     set_progress(db, "phase2_done", str(done))
     client.close()
-    db.close()
+    try:
+        db = ensure_db(db)
+        db.close()
+    except:
+        pass
     elapsed = time.time() - start_time
     log.info(f"\nPhase 2 complete: {done} done, {failed} failed, {skipped} skipped, {paywalled} paywalled in {elapsed/3600:.1f}h")
 
