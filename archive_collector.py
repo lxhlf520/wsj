@@ -412,16 +412,21 @@ def collect_day_articles(client: CDPClient, year: int, month: int, day: int, ret
     """采集某一天的文章列表（等待页面加载完成 + 日期验证 + 重试）"""
     url = f"{CHROME_WSJ_ARCHIVE}/{year}/{month:02d}/{day:02d}"
     date_str = f"{year}-{month:02d}-{day:02d}"
-    # 用于验证 __NEXT_DATA__ 属于目标日期的 JS
+    # 从 __NEXT_DATA__ 的路由参数中提取日期来判断页面是否已更新
     verify_js = """(() => {
         const el = document.getElementById('__NEXT_DATA__');
         if (!el) return null;
         try {
             const nd = JSON.parse(el.textContent);
-            const arts = nd.props.pageProps.newsArchiveArticles;
+            const qp = nd.props.pageProps;
+            // 优先从 query 参数获取日期
+            if (qp.query && qp.query.year) {
+                return qp.query.year + '-' + String(qp.query.month).padStart(2,'0') + '-' + String(qp.query.day).padStart(2,'0');
+            }
+            // 兆底：检查是否有文章存在
+            const arts = qp.newsArchiveArticles;
             if (!arts || arts.length === 0) return 'empty';
-            const ts = arts[0].timestamp || '';
-            return ts.substring(0, 10);
+            return 'has_articles';
         } catch(e) { return null; }
     })()"""
 
@@ -439,15 +444,18 @@ def collect_day_articles(client: CDPClient, year: int, month: int, day: int, ret
 
         # 验证页面日期是否匹配目标日期
         page_date = client.evaluate(verify_js, timeout=10)
-        if page_date == date_str:
-            # 日期匹配，提取完整数据
+        if page_date == date_str or page_date == 'has_articles':
+            # 日期匹配或无法确认但有文章，提取完整数据
             js = "document.getElementById('__NEXT_DATA__') ? document.getElementById('__NEXT_DATA__').textContent : null"
             raw = client.evaluate(js, timeout=15)
             if raw:
                 try:
                     nd = json.loads(raw)
                     articles = nd["props"]["pageProps"].get("newsArchiveArticles", [])
-                    log.info(f"  {date_str}: {len(articles)} articles")
+                    if page_date == date_str:
+                        log.info(f"  {date_str}: {len(articles)} articles")
+                    else:
+                        log.info(f"  {date_str}: {len(articles)} articles (date from route unavailable)")
                     return articles
                 except (json.JSONDecodeError, KeyError) as e:
                     log.warning(f"  Parse error for {date_str}: {e}")
@@ -459,7 +467,7 @@ def collect_day_articles(client: CDPClient, year: int, month: int, day: int, ret
             for _poll in range(5):
                 time.sleep(1.0)
                 page_date = client.evaluate(verify_js, timeout=10)
-                if page_date == date_str:
+                if page_date == date_str or page_date == 'has_articles':
                     js = "document.getElementById('__NEXT_DATA__') ? document.getElementById('__NEXT_DATA__').textContent : null"
                     raw = client.evaluate(js, timeout=15)
                     if raw:
