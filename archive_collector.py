@@ -409,20 +409,20 @@ def get_or_create_page() -> tuple[Optional[str], str]:
 # ============================================================
 
 def detect_captcha(client: CDPClient) -> Optional[str]:
-    """检测页面是否出现机器人验证（滑块/Challenge/PerimeterX等）"""
+    """检测页面是否出现机器人验证（仅在 __NEXT_DATA__ 不存在时调用）"""
     check_js = """(() => {
         const url = window.location.href || '';
         const title = document.title || '';
-        // 检查URL（PerimeterX/Cloudflare/WAF challenge常见路径）
-        if (/challenge|captcha|cdn-cgi|\\bpx\\b|block|denied|forbidden/i.test(url) && !url.includes('/news/archive')) {
+        // 检查URL是否被重定向到验证/拦截页面
+        if (/\\/challenge\\/|\\/captcha|\\/cdn-cgi\\/|\\/px-captcha|\\/verify/i.test(url)) {
             return 'challenge_url: ' + url;
         }
         // 检查页面标题
-        if (/robot\\s*check|security\\s*check|attention\\s*required|please\\s*verify|captcha|challenge/i.test(title)) {
+        if (/robot\\s*check|security\\s*check|attention\\s*required|please\\s*verify|just\\s*a\\s*moment/i.test(title)) {
             return 'challenge_title: ' + title;
         }
-        // 检查DOM中的验证相关元素
-        if (document.querySelector('#px-captcha, [id*="px-captcha"], [class*="px-captcha"], #cf-challenge-running, [class*="captcha-box"], [id*="captcha-"], iframe[src*="challenge"], iframe[src*="captcha"]')) {
+        // 检查DOM中的验证相关元素（更精确的选择器）
+        if (document.querySelector('#px-captcha, #cf-challenge-running, .px-captcha-container, iframe[src*="captcha"]')) {
             return 'captcha_element_detected';
         }
         return null;
@@ -467,17 +467,10 @@ def collect_day_articles(client: CDPClient, year: int, month: int, day: int, ret
         # 页面加载完成后，短暂等待确保 __NEXT_DATA__ 已渲染
         time.sleep(0.5)
 
-        # 检测是否触发机器人验证（滑块/CAPTCHA）
-        captcha = detect_captcha(client)
-        if captcha:
-            log.error(f"🚨 CAPTCHA detected at {date_str}: {captcha}")
-            log.error("脚本立即退出，请手动完成滑块验证后重新启动")
-            raise SystemExit(1)
-
-        # 验证页面日期是否匹配目标日期
+        # 先检查页面数据是否正常（有 __NEXT_DATA__ 就不是 CAPTCHA）
         page_date = client.evaluate(verify_js, timeout=10)
         if page_date == date_str or page_date == 'has_articles':
-            # 日期匹配或无法确认但有文章，提取完整数据
+            # 页面数据正常，直接提取
             js = "document.getElementById('__NEXT_DATA__') ? document.getElementById('__NEXT_DATA__').textContent : null"
             raw = client.evaluate(js, timeout=15)
             if raw:
@@ -494,28 +487,36 @@ def collect_day_articles(client: CDPClient, year: int, month: int, day: int, ret
         elif page_date == 'empty':
             log.info(f"  {date_str}: 0 articles (empty archive day)")
             return []
-        else:
-            # 页面加载了但日期不匹配，可能是SSR延迟，轮询几次
-            for _poll in range(5):
-                time.sleep(1.0)
-                page_date = client.evaluate(verify_js, timeout=10)
-                if page_date == date_str or page_date == 'has_articles':
-                    js = "document.getElementById('__NEXT_DATA__') ? document.getElementById('__NEXT_DATA__').textContent : null"
-                    raw = client.evaluate(js, timeout=15)
-                    if raw:
-                        try:
-                            nd = json.loads(raw)
-                            articles = nd["props"]["pageProps"].get("newsArchiveArticles", [])
-                            log.info(f"  {date_str}: {len(articles)} articles (after {_poll+1}s poll)")
-                            return articles
-                        except (json.JSONDecodeError, KeyError):
-                            pass
-                    break
-                elif page_date == 'empty':
-                    log.info(f"  {date_str}: 0 articles (empty archive day)")
-                    return []
 
-        log.warning(f"Date mismatch for {date_str}: got '{page_date}' (attempt {attempt + 1}/{retries})")
+        # 页面数据不正常（__NEXT_DATA__ 缺失或日期不匹配）
+        # 此时才检查是否为 CAPTCHA
+        captcha = detect_captcha(client)
+        if captcha:
+            log.error(f"🚨 CAPTCHA detected at {date_str}: {captcha}")
+            log.error("脚本立即退出，请手动完成滑块验证后重新启动")
+            raise SystemExit(1)
+
+        # 不是 CAPTCHA，可能是 SSR 延迟，轮询等待
+        for _poll in range(5):
+            time.sleep(1.0)
+            page_date = client.evaluate(verify_js, timeout=10)
+            if page_date == date_str or page_date == 'has_articles':
+                js = "document.getElementById('__NEXT_DATA__') ? document.getElementById('__NEXT_DATA__').textContent : null"
+                raw = client.evaluate(js, timeout=15)
+                if raw:
+                    try:
+                        nd = json.loads(raw)
+                        articles = nd["props"]["pageProps"].get("newsArchiveArticles", [])
+                        log.info(f"  {date_str}: {len(articles)} articles (after {_poll+1}s poll)")
+                        return articles
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+                break
+            elif page_date == 'empty':
+                log.info(f"  {date_str}: 0 articles (empty archive day)")
+                return []
+
+        log.warning(f"Page data unavailable for {date_str}: got '{page_date}' (attempt {attempt + 1}/{retries})")
         if attempt < retries - 1:
             log.info(f"  Retry {attempt + 1}/{retries} for {date_str}...")
 
