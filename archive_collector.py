@@ -433,55 +433,6 @@ def detect_captcha(client: CDPClient) -> Optional[str]:
         return None
 
 
-def wait_for_captcha_solved(client: CDPClient, target_url: str, max_wait: int = 600) -> bool:
-    """等待用户手动解决滑块验证。最多等 max_wait 秒。"""
-    log.warning("=" * 60)
-    log.warning("⚠️  检测到机器人验证页面（CAPTCHA/Challenge）")
-    log.warning("⚠️  请在 Chrome 浏览器窗口中手动完成滑块验证")
-    log.warning(f"⚠️  脚本将自动轮询检测验证状态（最多 {max_wait} 秒）")
-    log.warning("=" * 60)
-    # Windows 蜂鸣提示
-    try:
-        import winsound
-        for _ in range(5):
-            winsound.Beep(1200, 300)
-            time.sleep(0.4)
-    except:
-        # 非Windows环境用终端响铃
-        for _ in range(5):
-            print('\a', end='', flush=True)
-            time.sleep(0.4)
-
-    start = time.time()
-    poll_count = 0
-    while time.time() - start < max_wait:
-        poll_count += 1
-        time.sleep(3)
-        # 检查是否已回到正常页面
-        status_js = """(() => {
-            const url = window.location.href || '';
-            const nd = document.getElementById('__NEXT_DATA__');
-            if (url.includes('/news/archive') && nd) return 'solved';
-            // 还可能处于中间跳转态
-            if (url.includes('wsj.com')) return 'wsj_loading';
-            return 'still_challenge';
-        })()"""
-        try:
-            status = client.evaluate(status_js, timeout=5)
-        except:
-            status = 'still_challenge'
-        if status == 'solved':
-            log.info(f"✅ 验证已通过（轮询 {poll_count} 次），继续采集")
-            time.sleep(1)
-            return True
-        if poll_count % 10 == 0:
-            elapsed = int(time.time() - start)
-            log.info(f"  仍在等待验证...（已等待 {elapsed}s）")
-    log.error(f"⏰ 等待 {max_wait} 秒后仍未通过验证，脚本退出")
-    log.error("请手动验证后重跑脚本")
-    return False
-
-
 def collect_day_articles(client: CDPClient, year: int, month: int, day: int, retries: int = 3) -> list[dict]:
     """采集某一天的文章列表（等待页面加载完成 + 日期验证 + 重试）"""
     url = f"{CHROME_WSJ_ARCHIVE}/{year}/{month:02d}/{day:02d}"
@@ -519,14 +470,9 @@ def collect_day_articles(client: CDPClient, year: int, month: int, day: int, ret
         # 检测是否触发机器人验证（滑块/CAPTCHA）
         captcha = detect_captcha(client)
         if captcha:
-            log.warning(f"🚨 Captcha detected at {date_str}: {captcha}")
-            solved = wait_for_captcha_solved(client, url, max_wait=600)
-            if not solved:
-                log.error("Captcha not solved, stopping entire collection (please rerun later)")
-                raise SystemExit(1)
-            # 验证通过后重新导航到目标页面
-            client.navigate_and_wait(url, timeout=20)
-            time.sleep(0.5)
+            log.error(f"🚨 CAPTCHA detected at {date_str}: {captcha}")
+            log.error("脚本立即退出，请手动完成滑块验证后重新启动")
+            raise SystemExit(1)
 
         # 验证页面日期是否匹配目标日期
         page_date = client.evaluate(verify_js, timeout=10)
@@ -637,6 +583,12 @@ def run_phase1(max_articles: int = None):
                    (year == now.year and month == now.month and day > now.day):
                     continue
 
+                # 检查该天是否已完成
+                day_key = f"archive_day_{year}_{month:02d}_{day:02d}"
+                if get_progress(db, day_key) == "done":
+                    skipped_days += 1
+                    continue
+
                 try:
                     articles = collect_day_articles(client, year, month, day)
                     if articles:
@@ -647,6 +599,9 @@ def run_phase1(max_articles: int = None):
                         consecutive_errors = 0
                     else:
                         consecutive_errors += 1
+                except SystemExit:
+                    # CAPTCHA 触发，直接退出
+                    raise
                 except psycopg2.OperationalError as e:
                     log.error(f"DB error on {year}-{month:02d}-{day:02d}: {e}")
                     db = ensure_db(db)
@@ -654,6 +609,10 @@ def run_phase1(max_articles: int = None):
                 except Exception as e:
                     log.error(f"Error on {year}-{month:02d}-{day:02d}: {e}")
                     consecutive_errors += 1
+
+                # 记录该天已完成
+                db = ensure_db(db)
+                set_progress(db, day_key, "done")
 
                 total_days += 1
                 ensure_client()
@@ -663,20 +622,14 @@ def run_phase1(max_articles: int = None):
                     log.info(f"Reached max_articles limit ({max_articles}), stopping Phase 1")
                     break
 
-                # 每5天提交一次进度
-                if day % 5 == 0:
-                    try:
-                        db = ensure_db(db)
-                        db.commit()
-                    except Exception as e:
-                        log.warning(f"Commit failed: {e}, reconnecting...")
-                        db = ensure_db(db)
+                # 每10天输出一次进度日志
+                if total_days % 10 == 0:
                     log.info(f"  Progress: {year}-{month:02d} day {day}/{days_in_month}, "
                              f"total articles so far: {total_articles}")
 
                 time.sleep(DAY_PAGE_DELAY)
 
-            # 标记该月已完成
+            # 标记该月已完成（兼容旧的月度进度）
             db = ensure_db(db)
             set_progress(db, f"archive_month_{year}_{month:02d}", "done")
             log.info(f"Month {year}-{month:02d}: {month_articles} articles, "
