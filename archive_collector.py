@@ -563,11 +563,87 @@ def collect_day_articles(client: CDPClient, year: int, month: int, day: int, ret
     return []
 
 
-def run_phase1(max_articles: int = None):
-    """Phase 1: 采集所有日期的文章 URL，达到 max_articles 条后停止"""
-    log.info("=" * 50)
-    log.info(f"Phase 1: Collecting article URLs from archive (max_articles={max_articles or '∞'})")
-    log.info("=" * 50)
+def clear_progress_range(db, from_date: str, to_date: str) -> int:
+    """清除指定日期区间的所有进度标记（day + 覆盖的 month）
+    日期格式: YYYY-MM-DD
+    返回清除的记录数
+    """
+    from datetime import date as _date
+    try:
+        fy, fm, fd = map(int, from_date.split('-'))
+        ty, tm, td = map(int, to_date.split('-'))
+    except ValueError:
+        log.error(f"日期格式错误，应为 YYYY-MM-DD: {from_date} 或 {to_date}")
+        return 0
+    start = _date(fy, fm, fd)
+    end = _date(ty, tm, td)
+    if start > end:
+        log.error(f"起始日期 {from_date} 晚于结束日期 {to_date}")
+        return 0
+
+    db = ensure_db(db)
+    cur = db.cursor()
+    deleted = 0
+    # 清除 day 标记
+    cur.execute("SELECT key FROM scrape_progress WHERE key LIKE 'archive_day_%'")
+    rows = cur.fetchall()
+    for (key,) in rows:
+        # key 格式: archive_day_YYYY_MM_DD
+        try:
+            parts = key.split('_')
+            y, m, d = int(parts[2]), int(parts[3]), int(parts[4])
+            dt = _date(y, m, d)
+            if start <= dt <= end:
+                cur.execute("DELETE FROM scrape_progress WHERE key = %s", (key,))
+                deleted += 1
+        except (ValueError, IndexError):
+            continue
+    # 清除覆盖的 month 标记（避免 run_phase1 看到月已完成而跳过）
+    cur.execute("SELECT key FROM scrape_progress WHERE key LIKE 'archive_month_%'")
+    rows = cur.fetchall()
+    for (key,) in rows:
+        try:
+            parts = key.split('_')
+            y, m = int(parts[2]), int(parts[3])
+            # 月份与区间有任何重叠就清除
+            month_start = _date(y, m, 1)
+            import calendar
+            _, last_day = calendar.monthrange(y, m)
+            month_end = _date(y, m, last_day)
+            if month_start <= end and month_end >= start:
+                cur.execute("DELETE FROM scrape_progress WHERE key = %s", (key,))
+                deleted += 1
+                log.info(f"  Cleared month marker: {key}")
+        except (ValueError, IndexError):
+            continue
+    db.commit()
+    cur.close()
+    log.info(f"已清除 {from_date} ~ {to_date} 区间内 {deleted} 条进度标记")
+    return deleted
+
+
+def run_phase1(max_articles: int = None, from_date: str = None, to_date: str = None):
+    """Phase 1: 采集所有日期的文章 URL，达到 max_articles 条后停止
+    from_date / to_date: 可选日期范围过滤 (YYYY-MM-DD)，仅采集该区间
+    """
+    from datetime import date as _date
+    if from_date or to_date:
+        log.info("=" * 50)
+        log.info(f"Phase 1: RANGE mode ({from_date} ~ {to_date})")
+        log.info("=" * 50)
+    else:
+        log.info("=" * 50)
+        log.info(f"Phase 1: Collecting article URLs from archive (max_articles={max_articles or '∞'})")
+        log.info("=" * 50)
+
+    # 解析区间
+    range_start = range_end = None
+    if from_date:
+        fy, fm, fd = map(int, from_date.split('-'))
+        range_start = _date(fy, fm, fd)
+    if to_date:
+        ty, tm, td = map(int, to_date.split('-'))
+        range_end = _date(ty, tm, td)
 
     db = get_db()
     init_db()
@@ -617,6 +693,14 @@ def run_phase1(max_articles: int = None):
             month_articles = 0
 
             for day in range(1, days_in_month + 1):
+                # 区间过滤：跳过区间外的日期
+                if range_start or range_end:
+                    cur_d = _date(year, month, day)
+                    if range_start and cur_d < range_start:
+                        continue
+                    if range_end and cur_d > range_end:
+                        break  # 已超过区间上界，后续日期只会更大
+
                 # 判断是否超过当前日期（不采集未来日期）
                 now = datetime.now()
                 if year > now.year or (year == now.year and month > now.month) or \
@@ -984,6 +1068,8 @@ Usage:
   python archive_collector.py phase2 N    采集文章正文（最多N篇）
   python archive_collector.py stats       查看数据库统计
   python archive_collector.py all         从头开始：清空→Phase1→Phase2
+  python archive_collector.py rerun FROM TO  重跑指定日期区间(补充CAPTCHA漏采)
+                                          例: rerun 2020-08-01 2020-08-31
 """)
         return
 
@@ -1013,6 +1099,16 @@ Usage:
         clear_db()
         run_phase1()
         run_phase2()
+    elif cmd == "rerun":
+        if len(sys.argv) < 4:
+            print("Usage: python archive_collector.py rerun YYYY-MM-DD YYYY-MM-DD")
+            return
+        from_date, to_date = sys.argv[2], sys.argv[3]
+        db = get_db()
+        init_db()
+        clear_progress_range(db, from_date, to_date)
+        db.close()
+        run_phase1(from_date=from_date, to_date=to_date)
     else:
         print(f"Unknown command: {cmd}")
 
