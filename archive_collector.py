@@ -370,6 +370,17 @@ class CDPClient:
             return result["result"].get("value")
         return None
 
+    def capture_screenshot(self) -> Optional[bytes]:
+        """截取当前页面 PNG 字节"""
+        result = self.send_and_wait("Page.captureScreenshot", {"format": "png"}, timeout=10)
+        if result and "data" in result:
+            import base64
+            try:
+                return base64.b64decode(result["data"])
+            except Exception:
+                return None
+        return None
+
     def reconnect(self, ws_url: str, timeout: int = 30):
         """重新连接 WebSocket"""
         try:
@@ -409,21 +420,31 @@ def get_or_create_page() -> tuple[Optional[str], str]:
 # ============================================================
 
 def detect_captcha(client: CDPClient) -> Optional[str]:
-    """检测页面是否出现机器人验证（仅在 __NEXT_DATA__ 不存在且所有重试失败后调用）"""
+    """检测页面是否出现机器人验证。
+    DataDome CAPTCHA 特征：iframe[src*="captcha"] + body 为空 + title 仅为域名。
+    任意一条命中即返回原因。"""
     check_js = """(() => {
         const url = window.location.href || '';
-        const title = document.title || '';
-        // 检查URL是否被重定向到验证/拦截页面（更精确的路径匹配）
-        if (/\\/challenge\\/|\\/captcha\\/|\\/cdn-cgi\\/challenge|\\/px-captcha\\/|\\/verify\\//i.test(url)) {
+        const title = (document.title || '').trim();
+        const bodyText = (document.body && document.body.innerText || '').trim();
+        const hasNext = !!document.getElementById('__NEXT_DATA__');
+        // 1) 明确的挑战页面元素：DataDome / Cloudflare / PerimeterX
+        const captchaIframes = document.querySelectorAll('iframe[src*="captcha"], iframe[src*="challenge"], iframe[src*="datadome"], iframe[src*="perimeterx"], iframe[src*="px-captcha"]');
+        if (captchaIframes.length > 0) {
+            const src = captchaIframes[0].src || '';
+            return 'captcha_iframe: ' + src;
+        }
+        // 2) 明确以空/域名为标题 且 无 SSR 数据的 → 被拦截
+        if (!hasNext && (title === 'wsj.com' || title.length < 5) && bodyText.length < 50) {
+            return 'blocked_page: title="' + title + '", body_len=' + bodyText.length;
+        }
+        // 3) URL 路径被重定向到验证页
+        if (/\\/(challenge|captcha|cdn-cgi\\/challenge|px-captcha|datadome)\\//i.test(url)) {
             return 'challenge_url: ' + url;
         }
-        // 检查页面标题（更精确的匹配）
-        if (/robot\\s*check|security\\s*check|attention\\s*required|please\\s*verify|just\\s*a\\s*moment|access\\s*denied/i.test(title)) {
+        // 4) 明确拦截标题
+        if (/^(robot\\s*check|security\\s*check|attention\\s*required|please\\s*verify|just\\s*a\\s*moment|access\\s*denied)/i.test(title)) {
             return 'challenge_title: ' + title;
-        }
-        // 检查DOM中的验证相关元素（只检查明确的 CAPTCHA 容器）
-        if (document.querySelector('#px-captcha.px-captcha-container, #cf-challenge-running.cf-challenge, [class*="px-captcha-container"][data-visible="true"]')) {
-            return 'captcha_element_detected';
         }
         return null;
     })()"""
@@ -431,6 +452,21 @@ def detect_captcha(client: CDPClient) -> Optional[str]:
         return client.evaluate(check_js, timeout=5)
     except:
         return None
+
+
+def take_screenshot(client: CDPClient, save_path: str) -> bool:
+    """截图当前页面到本地文件（用于诊断 CAPTCHA）"""
+    try:
+        import os
+        os.makedirs(os.path.dirname(save_path) or '.', exist_ok=True)
+        png = client.capture_screenshot()
+        if png:
+            with open(save_path, 'wb') as f:
+                f.write(png)
+            return True
+    except Exception as e:
+        log.warning(f"Screenshot failed: {e}")
+    return False
 
 
 def collect_day_articles(client: CDPClient, year: int, month: int, day: int, retries: int = 3) -> list[dict]:
@@ -489,15 +525,17 @@ def collect_day_articles(client: CDPClient, year: int, month: int, day: int, ret
             return []
 
         # 页面数据不正常（__NEXT_DATA__ 缺失或日期不匹配）
-        # 只在最后一次重试时才检查 CAPTCHA（避免误判）
-        if attempt == retries - 1:
-            captcha = detect_captcha(client)
-            if captcha:
-                log.error(f"🚨 CAPTCHA detected at {date_str}: {captcha}")
-                log.error("脚本立即退出，请手动完成滑块验证后重新启动")
-                raise SystemExit(1)
+        # 每次重试都检查 CAPTCHA：DataDome 会在 iframe 中加载验证页面
+        captcha = detect_captcha(client)
+        if captcha:
+            screenshot_path = f"captcha_{date_str.replace('-', '_')}.png"
+            take_screenshot(client, screenshot_path)
+            log.error(f"🚨 CAPTCHA detected at {date_str}: {captcha}")
+            log.error(f"截图已保存到: {screenshot_path}")
+            log.error("脚本立即退出，请手动完成滑块验证后重新启动")
+            raise SystemExit(1)
 
-        # 不是最后一次重试，或不是 CAPTCHA，继续轮询等待
+        # 轮询等待 __NEXT_DATA__ 出现（可能是 SSR 延迟）
         for _poll in range(5):
             time.sleep(1.0)
             page_date = client.evaluate(verify_js, timeout=10)
