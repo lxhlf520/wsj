@@ -99,6 +99,16 @@ def init_db():
             cur.execute(f"ALTER TABLE Article_Info ADD COLUMN IF NOT EXISTS {col} {col_type}")
         except:
             pass
+    # 为 JOIN 补充索引（首次运行创建，后续 IF NOT EXISTS 跳过）
+    for ddl in [
+        "CREATE INDEX IF NOT EXISTS idx_daily_articles_url ON Daily_Articles(Article_URL)",
+        "CREATE INDEX IF NOT EXISTS idx_article_info_url ON Article_Info(Art_URL)",
+        "CREATE INDEX IF NOT EXISTS idx_daily_articles_date_id ON Daily_Articles(Date, id)",
+    ]:
+        try:
+            cur.execute(ddl)
+        except Exception as e:
+            log.warning(f"Index creation failed ({ddl}): {e}")
     db.commit()
     cur.close()
     db.close()
@@ -901,6 +911,13 @@ def run_phase2(max_articles: int = None):
 
     client = CDPClient(ws_url, timeout=30)
     client.enable_page_events()
+
+    # 先输出待采集总数
+    try:
+        pending = get_pending_count(db)
+        log.info(f"Pending articles: {pending}")
+    except Exception as e:
+        log.warning(f"Failed to get pending count: {e}")
 
     done = 0
     failed = 0

@@ -14,6 +14,8 @@ CREATE TABLE IF NOT EXISTS Daily_Articles (
 );
 CREATE INDEX IF NOT EXISTS idx_daily_articles_date ON Daily_Articles(Date);
 CREATE INDEX IF NOT EXISTS idx_daily_articles_year_month ON Daily_Articles(Year, Month);
+CREATE INDEX IF NOT EXISTS idx_daily_articles_url ON Daily_Articles(Article_URL);
+CREATE INDEX IF NOT EXISTS idx_daily_articles_date_id ON Daily_Articles(Date, id);
 
 -- 2. Article_Info
 CREATE TABLE IF NOT EXISTS Article_Info (
@@ -32,6 +34,7 @@ CREATE TABLE IF NOT EXISTS Article_Info (
 );
 CREATE INDEX IF NOT EXISTS idx_article_info_time ON Article_Info(Art_Time);
 CREATE INDEX IF NOT EXISTS idx_article_info_comments ON Article_Info(Comments_Count);
+CREATE INDEX IF NOT EXISTS idx_article_info_url ON Article_Info(Art_URL);
 
 -- 3. Comment_Info
 CREATE TABLE IF NOT EXISTS Comment_Info (
