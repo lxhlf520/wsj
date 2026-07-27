@@ -100,6 +100,7 @@ def init_db():
         except:
             pass
     # 为 JOIN 补充索引（首次运行创建，后续 IF NOT EXISTS 跳过）
+    log.info("Ensuring indexes for JOIN queries (first run may take a while)...")
     for ddl in [
         "CREATE INDEX IF NOT EXISTS idx_daily_articles_url ON Daily_Articles(Article_URL)",
         "CREATE INDEX IF NOT EXISTS idx_article_info_url ON Article_Info(Art_URL)",
