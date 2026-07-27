@@ -1068,6 +1068,77 @@ def run_phase2(max_articles: int = None):
     log.info(f"\nPhase 2 complete: {done} done, {failed} failed, {skipped} skipped, {paywalled} paywalled in {elapsed/3600:.1f}h")
 
 
+def run_login(timeout_minutes: int = 5):
+    """打开 WSJ 登录页，等待用户手动登录（检测到登录状态后退出）
+    供 phase2 后续采集使用同一浏览器的 cookie
+    """
+    log.info("=" * 50)
+    log.info("WSJ Login Helper")
+    log.info("=" * 50)
+
+    ws_url, _ = get_or_create_page()
+    if not ws_url:
+        log.error("No CDP page available")
+        return
+
+    client = CDPClient(ws_url, timeout=30)
+    client.enable_page_events()
+
+    # 导航到 WSJ 首页
+    log.info("Navigating to https://www.wsj.com ...")
+    client.navigate("https://www.wsj.com", timeout=15)
+    time.sleep(2)
+
+    # 检查是否已登录
+    check_js = """(() => {
+        // WSJ 已登录的特征:顶栏有 Sign Out / 账户头像,document.cookie 包含 dj_s 或类似会话 cookie
+        const text = document.body ? document.body.innerText : '';
+        if (/Sign\\s*Out|Sign\\s*out|My\\s*Account|Subscription|Account\\s*Settings/.test(text)) {
+            return 'logged_in_via_ui';
+        }
+        const cookies = document.cookie || '';
+        // 已登录的 WSJ cookie 名称
+        if (/dj_s|wsj_uuid|connect\\.sid|ab_uuid|client_jwt/.test(cookies)) {
+            return 'logged_in_via_cookie: ' + cookies.substring(0, 200);
+        }
+        return null;
+    })()"""
+    status = client.evaluate(check_js, timeout=5)
+    if status:
+        log.info(f"已检测到登录状态: {status}")
+        log.info("无需重新登录，直接运行 phase2 即可")
+        client.close()
+        return
+
+    # 未登录 → 打开登录页
+    log.info("未检测到登录状态，打开登录页...")
+    client.navigate("https://accounts.wsj.com/login", timeout=15)
+    time.sleep(3)
+
+    log.info("=" * 50)
+    log.info("请在弹出的 Chrome 窗口中手动登录你的 WSJ 账号")
+    log.info("脚本会轮询检测登录状态，检测到后自动退出")
+    log.info(f"最长等待 {timeout_minutes} 分钟")
+    log.info("=" * 50)
+
+    deadline = time.time() + timeout_minutes * 60
+    while time.time() < deadline:
+        try:
+            status = client.evaluate(check_js, timeout=5)
+            if status:
+                log.info(f"✅ 登录成功: {status}")
+                log.info("现在可以运行 phase2 了")
+                client.close()
+                return
+        except:
+            pass
+        time.sleep(3)
+
+    log.error(f"超时未检测到登录状态（{timeout_minutes} 分钟）")
+    log.error("请重试，或手动在 Chrome 中登录后再跑 phase2")
+    client.close()
+
+
 # ============================================================
 # 主入口
 # ============================================================
@@ -1088,6 +1159,7 @@ Usage:
   python archive_collector.py all         从头开始：清空→Phase1→Phase2
   python archive_collector.py rerun FROM TO  重跑指定日期区间(补充CAPTCHA漏采)
                                           例: rerun 2020-08-01 2020-08-31
+  python archive_collector.py login [MIN]   打开WSJ登录页,等待手动登录(默认5分钟,phase2前先跑)
 """)
         return
 
@@ -1127,6 +1199,9 @@ Usage:
         clear_progress_range(db, from_date, to_date)
         db.close()
         run_phase1(from_date=from_date, to_date=to_date)
+    elif cmd == "login":
+        mins = int(sys.argv[2]) if len(sys.argv) > 2 else 5
+        run_login(timeout_minutes=mins)
     else:
         print(f"Unknown command: {cmd}")
 
