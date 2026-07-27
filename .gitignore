@@ -1,0 +1,16 @@
+# 凭证 / 敏感文件（不应提交）
+client_jwt.txt
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 日志与调试产物
+*.log
+captcha_*.png
+*.screenshot.png
+
+# 临时测试脚本
+_test_*.py

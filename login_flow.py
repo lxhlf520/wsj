@@ -27,6 +27,14 @@ from pathlib import Path
 from urllib.parse import urlencode, unquote, parse_qs, urlparse
 
 import httpx
+from curl_cffi import requests as cc_requests
+
+# curl_cffi 浏览器指纹：DataDome 检测 TLS(JA3)指纹，必须用真实浏览器指纹绕过
+# 实测 chrome124 可过 /authorize 的 DataDome 检查（chrome/chrome120/safari 会被 412）
+IMPERSONATE = "chrome124"
+
+# www.wsj.com 在国内需走代理；可用环境变量 WSJ_PROXY 覆盖，置空字符串则直连
+PROXY = os.environ.get("WSJ_PROXY", "http://127.0.0.1:7890")
 
 # --- 常量 ---
 SSO_BASE = "https://sso.accounts.dowjones.com"
@@ -75,18 +83,22 @@ def print_jwt_info(jwt: str):
 def login(user: str, password: str) -> str | None:
     """执行完整 SSO 登录流程，返回 Client JWT。失败返回 None。"""
 
+    # 用 impersonate 时不手动设 UA / sec-ch-ua，curl_cffi 会自动给一致的浏览器头，
+    # 否则头与 TLS 指纹不一致又会被 DataDome 拦下
     base_headers = {
-        "user-agent": UA,
-        "accept-language": "zh-CN",
+        "accept-language": "en-US,en;q=0.9",
         "dnt": "1",
-        "sec-ch-ua": '"Chromium";v="110", "Not A(Brand";v="24", "Google Chrome";v="110"',
-        "sec-ch-ua-mobile": "?1",
-        "sec-ch-ua-platform": '"Android"',
     }
 
-    with httpx.Client(
+    # 分流：sso.accounts.dowjones.com 直连（代理 IP 会被 DataDome 412）；
+    #        www.wsj.com 被墙，必须走代理（Step5-7传 proxies=wsj_proxies）。同一 session 共享 cookie。
+    wsj_proxies = {"http": PROXY, "https": PROXY} if PROXY else None
+    if PROXY:
+        print(f"  wsj.com 使用代理: {PROXY}（sso 直连）")
+
+    with cc_requests.Session(
+        impersonate=IMPERSONATE,
         timeout=30,
-        follow_redirects=False,
         headers=base_headers,
     ) as c:
         # ═══════════════════════════════════════════
@@ -115,6 +127,7 @@ def login(user: str, password: str) -> str | None:
                 "sec-fetch-dest": "document",
                 "referer": f"{WSJ_BASE}/",
             },
+            allow_redirects=False,
         )
         print(f"  Status: {r.status_code}")
 
@@ -141,6 +154,7 @@ def login(user: str, password: str) -> str | None:
                 "sec-fetch-mode": "navigate",
                 "sec-fetch-dest": "document",
             },
+            allow_redirects=False,
         )
         print(f"  Status: {r.status_code}")
 
@@ -193,6 +207,7 @@ def login(user: str, password: str) -> str | None:
                 "origin": SSO_BASE,
                 "referer": final_url,
             },
+            allow_redirects=False,
         )
         print(f"  Status: {r.status_code}")
 
@@ -247,6 +262,7 @@ def login(user: str, password: str) -> str | None:
                 "sec-fetch-mode": "navigate",
                 "sec-fetch-dest": "document",
             },
+            allow_redirects=False,
         )
         print(f"  Status: {r.status_code}")
 
@@ -289,6 +305,8 @@ def login(user: str, password: str) -> str | None:
                     "sec-fetch-mode": "navigate",
                     "sec-fetch-dest": "document",
                 },
+                allow_redirects=False,
+                proxies=wsj_proxies,
             )
             print(f"  Hop {hop}: {r.status_code} → {next_url[:120]}")
 
@@ -325,6 +343,8 @@ def login(user: str, password: str) -> str | None:
                 "sec-fetch-mode": "navigate",
                 "sec-fetch-dest": "document",
             },
+            allow_redirects=False,
+            proxies=wsj_proxies,
         )
         print(f"  Status: {r.status_code}")
 
@@ -349,6 +369,8 @@ def login(user: str, password: str) -> str | None:
                 "sec-fetch-dest": "empty",
                 "referer": f"{WSJ_BASE}/",
             },
+            allow_redirects=False,
+            proxies=wsj_proxies,
         )
         print(f"  Status: {r.status_code}")
 

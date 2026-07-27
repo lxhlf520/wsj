@@ -40,6 +40,10 @@ from config import PG_CONFIG
 # GraphQL 端点
 GQL_ENDPOINT = "https://shared-data.dowjones.io/gateway/graphql"
 
+# shared-data.dowjones.io 在国内被墙，必须走代理（直连超时）。
+# 可用环境变量 WSJ_PROXY 覆盖，置空字符串则直连（境外服务器部署时）。
+PROXY = os.environ.get("WSJ_PROXY", "http://127.0.0.1:7890")
+
 # Apollo Persisted Query Hashes
 HASH_ARTICLE_META_BY_URL = "e36182f1af30342ab15b1cb80595a91da68b0fa62365a5d98781e7b2cb6f4843"
 HASH_ARTICLE_CONTENT = "e03e6948cd028f43cbeac977eb337f719cdd82678e124fef2afec86d9d02d2e7"
@@ -507,6 +511,7 @@ def _get_thread_session() -> httpx.Client:
             timeout=30,
             limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
             http2=True,
+            proxy=PROXY or None,
         )
     return _thread_local.session
 
@@ -629,6 +634,7 @@ def run_collector(max_articles: int = None, num_workers: int = MAX_WORKERS):
     log.info("=" * 60)
     log.info(f"WSJ GraphQL Body Collector ({num_workers} workers)")
     log.info("=" * 60)
+    log.info(f"Proxy: {PROXY or '直连(无代理)'}  → GraphQL 端点在国内需代理")
 
     # 1. 加载 Client JWT
     client_jwt = load_client_jwt()
