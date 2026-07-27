@@ -1139,6 +1139,102 @@ def run_login(timeout_minutes: int = 5):
     client.close()
 
 
+def run_jwt_via_cdp():
+    """通过已登录的 CDP 浏览器获取 Client JWT（绕过 DataDome）。
+    前提: Chrome 已以 --remote-debugging 启动 且 用户已登录 WSJ。
+    JWT 保存到 client_jwt.txt,供 graphql_collector.py 使用。
+    """
+    log.info("=" * 50)
+    log.info("WSJ JWT Extractor (via CDP)")
+    log.info("=" * 50)
+
+    ws_url, _ = get_or_create_page()
+    if not ws_url:
+        log.error("No CDP page available")
+        return
+
+    client = CDPClient(ws_url, timeout=30)
+    client.enable_page_events()
+
+    # 先检查是否已登录
+    log.info("Checking login status...")
+    client.navigate("https://www.wsj.com", timeout=15)
+    time.sleep(2)
+    check_js = """(() => {
+        const cookies = document.cookie || '';
+        if (/dj_s|connect\\.sid|ab_uuid|client_jwt|wsj_uuid/.test(cookies)) {
+            return 'has_cookies';
+        }
+        return null;
+    })()"""
+    status = client.evaluate(check_js, timeout=5)
+    if not status:
+        log.error("❌ Chrome 未登录 WSJ。请先跑 `python archive_collector.py login` 完成登录")
+        client.close()
+        return
+
+    log.info("✅ 检测到登录状态,调用 /client?legacy=false 拿 JWT...")
+
+    # 在页面 context 里 fetch /client?legacy=false,走浏览器 cookie
+    jwt_js = """(async () => {
+        try {
+            const r = await fetch('https://www.wsj.com/client?legacy=false', {
+                credentials: 'include',
+                headers: { 'accept': 'application/json' }
+            });
+            if (!r.ok) return 'http_' + r.status;
+            const data = await r.json();
+            // 返回的 JSON 结构依 WSJ 版本不同
+            const token = data.token || data.jwt || data.access_token || data.accessToken;
+            return token ? 'JWT_OK' : 'no_token_field: ' + JSON.stringify(data).substring(0, 300);
+        } catch (e) {
+            return 'error: ' + e.message;
+        }
+    })()"""
+    result = client.evaluate(jwt_js, timeout=20)
+    if not result or not result.startswith("eyJ"):
+        # evaluate 只能返回 string, 实际可能只看到状态 - 需要采取另一种方式取真实 JWT
+        # 改为 navigate + 获取页面文本
+        log.info(f"  fetch 预览结果: {result}")
+        log.info("  改为 navigate + 抓取页面 body...")
+        client.navigate("https://www.wsj.com/client?legacy=false", timeout=15)
+        time.sleep(2)
+        body_js = "document.body ? document.body.innerText : ''"
+        body = client.evaluate(body_js, timeout=10)
+        if body and "eyJ" in body:
+            import re
+            m = re.search(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", body)
+            if m:
+                result = m.group(0)
+                log.info(f"  从页面 body 提取到 JWT (前 40 字符): {result[:40]}...")
+
+    if not result or not result.startswith("eyJ"):
+        log.error(f"❌ 未获取到 JWT: {result}")
+        client.close()
+        return
+
+    # 保存到 client_jwt.txt
+    token_file = Path(__file__).parent / "client_jwt.txt"
+    token_file.write_text(result)
+    log.info(f"✅ JWT 已保存到 {token_file}")
+    log.info(f"  有效期检查: {result[:40]}...")
+    try:
+        import base64
+        payload = result.split(".")[1]
+        payload += "=" * ((4 - len(payload) % 4) % 4)
+        data = json.loads(base64.urlsafe_b64decode(payload))
+        exp = data.get("exp", 0)
+        from datetime import datetime as _dt
+        log.info(f"  过期时间: {_dt.fromtimestamp(exp)}")
+    except Exception as e:
+        log.warning(f"  JWT 解析失败: {e}")
+
+    log.info("")
+    log.info("现在可以跑 graphql_collector.py 了:")
+    log.info("  uv run python graphql_collector.py")
+    client.close()
+
+
 # ============================================================
 # 主入口
 # ============================================================
@@ -1160,6 +1256,7 @@ Usage:
   python archive_collector.py rerun FROM TO  重跑指定日期区间(补充CAPTCHA漏采)
                                           例: rerun 2020-08-01 2020-08-31
   python archive_collector.py login [MIN]   打开WSJ登录页,等待手动登录(默认5分钟,phase2前先跑)
+  python archive_collector.py jwt           从已登录Chrome拿Client JWT到client_jwt.txt(给graphql_collector用)
 """)
         return
 
@@ -1202,6 +1299,8 @@ Usage:
     elif cmd == "login":
         mins = int(sys.argv[2]) if len(sys.argv) > 2 else 5
         run_login(timeout_minutes=mins)
+    elif cmd == "jwt":
+        run_jwt_via_cdp()
     else:
         print(f"Unknown command: {cmd}")
 
