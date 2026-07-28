@@ -161,6 +161,39 @@ def get_db():
     return psycopg2.connect(**PG_CONFIG)
 
 
+def _conn_alive(conn) -> bool:
+    """检测连接是否可用（长跑中服务器可能主动断开空闲连接）"""
+    if conn is None or conn.closed:
+        return False
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT 1")
+        cur.fetchone()
+        cur.close()
+        return True
+    except Exception:
+        return False
+
+
+def _ensure_conn(conn):
+    """返回一个可用连接，断开则重连（防止长跑中 server closed the connection 崩溃）"""
+    if _conn_alive(conn):
+        return conn
+    try:
+        if conn is not None and not conn.closed:
+            conn.close()
+    except Exception:
+        pass
+    log.warning("DB connection lost, reconnecting...")
+    for attempt in range(1, 6):
+        try:
+            return get_db()
+        except Exception as e:
+            log.warning(f"Reconnect attempt {attempt}/5 failed: {e}")
+            time.sleep(min(2 * attempt, 10))
+    raise RuntimeError("Failed to reconnect to database after 5 attempts")
+
+
 def get_pending_urls(db, limit: int = BATCH_SIZE) -> list[tuple]:
     """获取尚未采集正文的文章 URL（从旧到新）"""
     cur = db.cursor()
@@ -517,7 +550,13 @@ def _get_thread_session() -> httpx.Client:
 
 
 def _get_thread_db():
-    if not hasattr(_thread_local, 'db'):
+    db = getattr(_thread_local, 'db', None)
+    if not _conn_alive(db):
+        try:
+            if db is not None and not db.closed:
+                db.close()
+        except Exception:
+            pass
         _thread_local.db = get_db()
     return _thread_local.db
 
@@ -696,7 +735,8 @@ def run_collector(max_articles: int = None, num_workers: int = MAX_WORKERS):
                 log.error("Auth expired, stopping...")
                 break
 
-            # 取一批待采集 URL
+            # 取一批待采集 URL（长跑中主连接可能被断开，先确保可用）
+            db = _ensure_conn(db)
             urls = get_pending_urls(db, limit=BATCH_SIZE)
             if not urls:
                 log.info("No more pending articles!")
@@ -742,7 +782,8 @@ def run_collector(max_articles: int = None, num_workers: int = MAX_WORKERS):
                             ff.cancel()
                     break
 
-            # 每批提交 DB 并报告进度
+            # 每批提交 DB 并报告进度（等待整批期间主连接可能空闲被断开，重连后再提交）
+            db = _ensure_conn(db)
             db.commit()
             elapsed = time.time() - start_time
             rate = state.done / elapsed * 3600 if elapsed > 0 else 0
@@ -754,6 +795,7 @@ def run_collector(max_articles: int = None, num_workers: int = MAX_WORKERS):
 
             # 保存进度
             try:
+                db = _ensure_conn(db)
                 cur = db.cursor()
                 cur.execute("""
                     INSERT INTO scrape_progress (key, value)
@@ -766,8 +808,12 @@ def run_collector(max_articles: int = None, num_workers: int = MAX_WORKERS):
                 pass
 
     # 清理
-    db.commit()
-    db.close()
+    try:
+        db = _ensure_conn(db)
+        db.commit()
+        db.close()
+    except Exception as e:
+        log.warning(f"Final commit/close skipped: {e}")
 
     elapsed = time.time() - start_time
     log.info(f"\n{'='*60}")
