@@ -64,6 +64,7 @@ SAVE_INTERVAL = 50        # 每 N 篇文章提交一次 DB
 MAX_RETRIES = 3           # 单个文章最大重试次数
 RATE_LIMIT_COOLDOWN = 60  # 遇到 429 限流后的冷却时间（秒）
 MAX_WORKERS = 4           # 多线程默认线程数
+MAX_JWT_REFRESHES = 20    # 单轮采集中 JWT 最大续期次数（JWT 有效期 48h）
 
 # Token 文件（存储 Client JWT，过期时自动重新登录获取）
 TOKEN_FILE = Path(__file__).parent / "client_jwt.txt"
@@ -144,6 +145,28 @@ def load_client_jwt(auto_login: bool = True) -> Optional[str]:
                     return new_jwt
             except Exception as e:
                 log.warning(f"Auto-login failed: {e}")
+    return None
+
+
+def refresh_client_jwt(max_attempts: int = 3) -> Optional[str]:
+    """JWT 过期时重新登录换取新 JWT（login_flow 内部会写回 client_jwt.txt）"""
+    user, password = _load_credentials()
+    if not user or not password:
+        log.error("JWT expired but no WSJ_USER/WSJ_PASS in .env, cannot re-login")
+        return None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            log.info(f"Refreshing JWT via SSO login (attempt {attempt}/{max_attempts})...")
+            from login_flow import login as sso_login
+            jwt = sso_login(user, password)
+            if jwt:
+                log.info("JWT refreshed successfully")
+                return jwt
+            log.warning(f"JWT refresh attempt {attempt}/{max_attempts} returned no token")
+        except Exception as e:
+            log.warning(f"JWT refresh attempt {attempt}/{max_attempts} failed: {e}")
+        if attempt < max_attempts:
+            time.sleep(min(15 * attempt, 60))
     return None
 
 
@@ -529,6 +552,10 @@ class CollectorState:
         with self.lock:
             self.auth_expired = True
 
+    def clear_auth_expired(self):
+        with self.lock:
+            self.auth_expired = False
+
     def is_auth_expired(self):
         with self.lock:
             return self.auth_expired
@@ -724,6 +751,10 @@ def run_collector(max_articles: int = None, num_workers: int = MAX_WORKERS):
 
     log.info(f"Starting collection (max: {max_articles or 'unlimited'}, workers: {num_workers})...")
 
+    # JWT 续期计数与防护：记录上次续期时的完成数，用于识别“续期后仍毫无进展”
+    jwt_refreshes = 0
+    done_at_last_refresh = -1
+
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
         while True:
             # 检查是否达到上限
@@ -732,8 +763,22 @@ def run_collector(max_articles: int = None, num_workers: int = MAX_WORKERS):
                 break
 
             if state.is_auth_expired():
-                log.error("Auth expired, stopping...")
-                break
+                # 防无限重登：上次续期后没采成任何一篇，说明不是单纯过期（如权限/接口变更）
+                if state.done == done_at_last_refresh:
+                    log.error("Auth expired again with no progress since last refresh, stopping...")
+                    break
+                if jwt_refreshes >= MAX_JWT_REFRESHES:
+                    log.error(f"Reached max JWT refreshes ({MAX_JWT_REFRESHES}), stopping...")
+                    break
+                done_at_last_refresh = state.done
+                new_jwt = refresh_client_jwt()
+                if not new_jwt:
+                    log.error("JWT refresh failed, stopping...")
+                    break
+                client_jwt = new_jwt
+                jwt_refreshes += 1
+                state.clear_auth_expired()
+                log.info(f"JWT refreshed (#{jwt_refreshes}), resuming collection...")
 
             # 取一批待采集 URL（长跑中主连接可能被断开，先确保可用）
             db = _ensure_conn(db)
