@@ -29,9 +29,12 @@ from urllib.parse import urlencode, unquote, parse_qs, urlparse
 import httpx
 from curl_cffi import requests as cc_requests
 
-# curl_cffi 浏览器指纹：DataDome 检测 TLS(JA3)指纹，必须用真实浏览器指纹绕过
-# 实测 chrome124 可过 /authorize 的 DataDome 检查（chrome/chrome120/safari 会被 412）
-IMPERSONATE = "chrome124"
+# curl_cffi 浏览器指纹：DataDome 检测 TLS(JA3)指纹，必须用真实浏览器指纹绕过。
+# DataDome 会不定期调整检测导致单一指纹失效，因此按候选列表依次尝试，
+# Step 1 被 412 拦下就自动换下一个指纹重试。
+# 2026-07-30 实测：chrome131 / chrome131_android 可过 /authorize；
+#            chrome123/124/133a/136/142/145/146、firefox147、safari260 均被 412。
+IMPERSONATE_CANDIDATES = ["chrome131", "chrome131_android"]
 
 # www.wsj.com 在国内需走代理；可用环境变量 WSJ_PROXY 覆盖，置空字符串则直连
 PROXY = os.environ.get("WSJ_PROXY", "http://127.0.0.1:7890")
@@ -81,7 +84,30 @@ def print_jwt_info(jwt: str):
 
 
 def login(user: str, password: str) -> str | None:
-    """执行完整 SSO 登录流程，返回 Client JWT。失败返回 None。"""
+    """执行完整 SSO 登录流程，返回 Client JWT。失败返回 None。
+
+    按 IMPERSONATE_CANDIDATES 依次尝试浏览器指纹，某个指纹被 DataDome 拦下时自动降级到下一个。
+    """
+    total = len(IMPERSONATE_CANDIDATES)
+    for idx, impersonate in enumerate(IMPERSONATE_CANDIDATES, 1):
+        print(f"\n【指纹 {idx}/{total}】impersonate = {impersonate}")
+        try:
+            jwt = _login_once(user, password, impersonate)
+        except Exception as e:
+            print(f"  ⚠️  指纹 {impersonate} 执行异常: {type(e).__name__}: {e}")
+            jwt = None
+        if jwt:
+            return jwt
+        if idx < total:
+            print(f"  ↻ 指纹 {impersonate} 登录失败，换下一个指纹重试...")
+            time.sleep(3)
+    print(f"\n❌ 所有指纹均登录失败（已尝试: {', '.join(IMPERSONATE_CANDIDATES)}）")
+    print("   若全部卡在 Step 1 的 412，说明 DataDome 又调整了检测，需重新探测可用指纹。")
+    return None
+
+
+def _login_once(user: str, password: str, impersonate: str) -> str | None:
+    """用指定浏览器指纹执行一轮完整 SSO 登录流程"""
 
     # 用 impersonate 时不手动设 UA / sec-ch-ua，curl_cffi 会自动给一致的浏览器头，
     # 否则头与 TLS 指纹不一致又会被 DataDome 拦下
@@ -97,7 +123,7 @@ def login(user: str, password: str) -> str | None:
         print(f"  wsj.com 使用代理: {PROXY}（sso 直连）")
 
     with cc_requests.Session(
-        impersonate=IMPERSONATE,
+        impersonate=impersonate,
         timeout=30,
         headers=base_headers,
     ) as c:
