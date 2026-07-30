@@ -1143,6 +1143,7 @@ def run_jwt_via_cdp():
     """通过已登录的 CDP 浏览器获取 Client JWT（绕过 DataDome）。
     前提: Chrome 已以 --remote-debugging 启动 且 用户已登录 WSJ。
     JWT 保存到 client_jwt.txt,供 graphql_collector.py 使用。
+    成功时返回 JWT 字符串（供 graphql_collector 直接调用），失败返回 None。
     """
     log.info("=" * 50)
     log.info("WSJ JWT Extractor (via CDP)")
@@ -1151,7 +1152,7 @@ def run_jwt_via_cdp():
     ws_url, _ = get_or_create_page()
     if not ws_url:
         log.error("No CDP page available")
-        return
+        return None
 
     client = CDPClient(ws_url, timeout=30)
     client.enable_page_events()
@@ -1171,7 +1172,7 @@ def run_jwt_via_cdp():
     if not status:
         log.error("❌ Chrome 未登录 WSJ。请先跑 `python archive_collector.py login` 完成登录")
         client.close()
-        return
+        return None
 
     log.info("✅ 检测到登录状态,调用 /client?legacy=false 拿 JWT...")
 
@@ -1211,7 +1212,7 @@ def run_jwt_via_cdp():
     if not result or not result.startswith("eyJ"):
         log.error(f"❌ 未获取到 JWT: {result}")
         client.close()
-        return
+        return None
 
     # 保存到 client_jwt.txt
     token_file = Path(__file__).parent / "client_jwt.txt"
@@ -1233,6 +1234,7 @@ def run_jwt_via_cdp():
     log.info("现在可以跑 graphql_collector.py 了:")
     log.info("  uv run python graphql_collector.py")
     client.close()
+    return result
 
 
 # ============================================================

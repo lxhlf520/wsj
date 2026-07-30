@@ -120,39 +120,44 @@ def load_client_jwt(auto_login: bool = True) -> Optional[str]:
                         return jwt
             except Exception:
                 pass
-            # JWT 可能过期或损坏，如果有密码尝试自动登录
+            # JWT 可能过期或损坏，尝试重新获取
             if auto_login:
-                user, password = _load_credentials()
-                if user and password:
-                    log.info("Client JWT expired/missing, attempting auto-login...")
-                    try:
-                        from login_flow import login as sso_login
-                        new_jwt = sso_login(user, password)
-                        if new_jwt:
-                            return new_jwt
-                    except Exception as e:
-                        log.warning(f"Auto-login failed: {e}")
-            return None
-    # 无文件，尝试自动登录
-    if auto_login:
-        user, password = _load_credentials()
-        if user and password:
-            log.info("No Client JWT file found, attempting auto-login...")
-            try:
-                from login_flow import login as sso_login
-                new_jwt = sso_login(user, password)
+                log.info("Client JWT expired/missing, attempting to acquire a new one...")
+                new_jwt = acquire_client_jwt()
                 if new_jwt:
                     return new_jwt
-            except Exception as e:
-                log.warning(f"Auto-login failed: {e}")
+            return None
+    # 无文件，尝试自动获取
+    if auto_login:
+        log.info("No Client JWT file found, attempting to acquire one...")
+        new_jwt = acquire_client_jwt()
+        if new_jwt:
+            return new_jwt
     return None
 
 
-def refresh_client_jwt(max_attempts: int = 3) -> Optional[str]:
-    """JWT 过期时重新登录换取新 JWT（login_flow 内部会写回 client_jwt.txt）"""
+def _jwt_via_cdp() -> Optional[str]:
+    """从已登录的 CDP 浏览器抓取 Client JWT（DataDome 只拦 SSO 登录接口，浏览器路径不受影响）"""
+    try:
+        from archive_collector import run_jwt_via_cdp
+        jwt = run_jwt_via_cdp()
+        if jwt:
+            log.info("JWT obtained via CDP browser")
+            return jwt
+        log.warning("CDP browser returned no JWT (Chrome 未启动远程调试 或 未登录 WSJ)")
+    except Exception as e:
+        log.warning(f"CDP JWT fetch failed: {e}")
+    return None
+
+
+def _jwt_via_sso(max_attempts: int = 3) -> Optional[str]:
+    """用账号密码走纯协议 SSO 登录换 JWT（login_flow 内部会写回 client_jwt.txt）
+
+    2026-07-30 起 DataDome 对 /authenticate 加了验证码挑战，此路径大概率失败，仅作兜底。
+    """
     user, password = _load_credentials()
     if not user or not password:
-        log.error("JWT expired but no WSJ_USER/WSJ_PASS in .env, cannot re-login")
+        log.warning("No WSJ_USER/WSJ_PASS in .env, skip SSO login fallback")
         return None
     for attempt in range(1, max_attempts + 1):
         try:
@@ -160,7 +165,7 @@ def refresh_client_jwt(max_attempts: int = 3) -> Optional[str]:
             from login_flow import login as sso_login
             jwt = sso_login(user, password)
             if jwt:
-                log.info("JWT refreshed successfully")
+                log.info("JWT refreshed successfully via SSO login")
                 return jwt
             log.warning(f"JWT refresh attempt {attempt}/{max_attempts} returned no token")
         except Exception as e:
@@ -168,6 +173,19 @@ def refresh_client_jwt(max_attempts: int = 3) -> Optional[str]:
         if attempt < max_attempts:
             time.sleep(min(15 * attempt, 60))
     return None
+
+
+def acquire_client_jwt() -> Optional[str]:
+    """获取新的 Client JWT：优先浏览器(CDP)，失败再退回纯协议 SSO 登录
+
+    浏览器路径要求 Chrome 以 --remote-debugging-port=9222 启动且已登录 WSJ；
+    协议路径要求 .env 里有 WSJ_USER/WSJ_PASS，但目前被 DataDome 验证码拦着。
+    """
+    jwt = _jwt_via_cdp()
+    if jwt:
+        return jwt
+    log.info("Falling back to SSO protocol login...")
+    return _jwt_via_sso()
 
 
 def save_client_jwt(jwt: str):
@@ -707,9 +725,13 @@ def run_collector(max_articles: int = None, num_workers: int = MAX_WORKERS):
     if not client_jwt:
         log.error("No valid Client JWT found!")
         log.error("Options:")
-        log.error(f"  1. Set WSJ_USER/WSJ_PASS in .env for auto-login")
-        log.error(f"  2. Run: python login_flow.py -u EMAIL -p PASSWORD")
-        log.error(f"  3. Save JWT manually to: {TOKEN_FILE}")
+        log.error(f"  1. 浏览器路径（推荐，不受 DataDome 影响）:")
+        log.error(f"     a) 启动带远程调试的 Chrome: chrome --remote-debugging-port=9222")
+        log.error(f"     b) 在该浏览器里登录 wsj.com（或 python archive_collector.py login）")
+        log.error(f"     c) 取 JWT: python archive_collector.py jwt")
+        log.error(f"  2. 协议登录（DataDome 验证码拦截时会失败）: 在 .env 设置 WSJ_USER/WSJ_PASS")
+        log.error(f"     或运行: python login_flow.py -u EMAIL -p PASSWORD")
+        log.error(f"  3. 手动把 JWT 存到: {TOKEN_FILE}")
         return
 
     # 2. 连接数据库（主线程用）
@@ -771,7 +793,7 @@ def run_collector(max_articles: int = None, num_workers: int = MAX_WORKERS):
                     log.error(f"Reached max JWT refreshes ({MAX_JWT_REFRESHES}), stopping...")
                     break
                 done_at_last_refresh = state.done
-                new_jwt = refresh_client_jwt()
+                new_jwt = acquire_client_jwt()
                 if not new_jwt:
                     log.error("JWT refresh failed, stopping...")
                     break
