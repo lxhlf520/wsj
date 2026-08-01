@@ -103,32 +103,54 @@ def get_db():
     return psycopg2.connect(**PG_CONFIG)
 
 
-def get_articles_for_comments(db, limit: int):
-    """获取有正文但尚未采集评论的文章（只选有 originId 的）"""
+def claim_articles_for_comments(db, limit: int) -> list:
+    """原子认领待采集评论的文章（多实例分布式安全）
+
+    通过 UPDATE ... SET Comments_Count = -1 RETURNING 实现原子占坑：
+    多个实例并发执行时各自拿到不重叠的文章批次。
+    Comments_Count = -1 表示「处理中」，防止其他实例重复认领；
+    处理完后由 update_comments_count() 改回真实值。
+
+    启动时 reset_stale_comment_claims() 会把崩溃残留的 -1 重置为 NULL。
+    """
     cur = db.cursor()
     cur.execute("""
-        SELECT a.Art_ID, a.Art_Title, a.Art_URL
-        FROM Article_Info a
-        WHERE a.Art_Text IS NOT NULL
-          AND a.Art_Title NOT LIKE 'FAILED:%%'
-          AND a.Art_ID IS NOT NULL
-          AND a.Art_ID != ''
-          AND (a.Art_ID LIKE 'WP-WSJ-%%' OR a.Art_ID LIKE 'SB%%')
-        ORDER BY a.scrape_time ASC
-        LIMIT %s
+        UPDATE Article_Info
+        SET Comments_Count = -1
+        WHERE Art_ID IN (
+            SELECT Art_ID FROM Article_Info
+            WHERE Art_Text IS NOT NULL
+              AND Art_Title NOT LIKE 'FAILED:%%'
+              AND Art_ID IS NOT NULL
+              AND Art_ID != ''
+              AND (Art_ID LIKE 'WP-WSJ-%%' OR Art_ID LIKE 'SB%%')
+              AND Comments_Count IS NULL
+            ORDER BY scrape_time ASC
+            LIMIT %s
+            FOR UPDATE SKIP LOCKED
+        )
+        RETURNING Art_ID, Art_Title, Art_URL
     """, (limit,))
     rows = cur.fetchall()
+    db.commit()  # 提交行锁，其他实例可认领剩余文章
     cur.close()
     return rows
 
 
-def get_comment_count_for_article(db, art_id: str) -> int:
-    """查询某文章已采集的评论数"""
+def reset_stale_comment_claims(db):
+    """启动时重置崩溃残留的处理中标记（Comments_Count = -1 → NULL）"""
     cur = db.cursor()
-    cur.execute("SELECT COUNT(*) FROM comment_info WHERE article_id = %s", (art_id,))
-    cnt = cur.fetchone()[0]
+    cur.execute(
+        "UPDATE Article_Info SET Comments_Count = NULL WHERE Comments_Count = -1"
+    )
+    n = cur.rowcount
+    if n > 0:
+        log.warning(
+            f"Reset {n} stale comment claims "
+            f"(Comments_Count = -1, likely from crashed run)"
+        )
+    db.commit()
     cur.close()
-    return cnt
 
 
 def save_comment(db, art_id: str, comment: dict) -> bool:
@@ -689,11 +711,14 @@ def backfill_likes(max_comments: int = None):
 # 主流程
 # ============================================================
 
-def run(max_articles: int = 5):
-    """运行评论采集
+def run(max_articles: int = None):
+    """运行评论采集（支持多实例分布式部署）
+
+    每轮原子认领一批文章，处理完再认领下一批，直到没有待采集文章或达到上限。
+    多个实例并发执行时，SQL 层 FOR UPDATE SKIP LOCKED 确保各自拿到不重叠的批次。
 
     Args:
-        max_articles: 最多处理的文章数（None = 全量）
+        max_articles: 最多处理的文章总数（None = 全量，一直跑到空）
     """
     log.info("=" * 60)
     log.info("WSJ Spot.im Comment Collector (APP API)")
@@ -706,91 +731,130 @@ def run(max_articles: int = 5):
         return
 
     db = get_db()
+
+    # 启动时清理上次崩溃残留的 -1 标记，恢复为待采集
+    reset_stale_comment_claims(db)
+
     session = httpx.Client(timeout=30, http2=True)
+    stats = {"done": 0, "failed": 0, "no_comments": 0, "total_comments": 0}
+    batch_no = 0
+    start_time = time.time()
 
     try:
-        # 获取待采集文章
-        limit = max_articles if max_articles else BATCH_SIZE
-        articles = get_articles_for_comments(db, limit)
-        log.info(f"Articles to process: {len(articles)}")
+        while True:
+            # 已达上限则退出
+            if max_articles and stats["done"] >= max_articles:
+                log.info(f"Reached max_articles limit ({max_articles}), stopping.")
+                break
 
-        if not articles:
-            log.info("No articles with body found. Run graphql_collector.py first.")
-            return
+            # 本批认领量：不超过剩余配额（如果有上限）
+            claim_limit = BATCH_SIZE
+            if max_articles:
+                claim_limit = min(BATCH_SIZE, max_articles - stats["done"])
 
-        stats = {"done": 0, "failed": 0, "no_comments": 0, "total_comments": 0}
+            articles = claim_articles_for_comments(db, claim_limit)
+            if not articles:
+                log.info("No more articles to process.")
+                break
 
-        for i, (art_id, art_title, art_url) in enumerate(articles):
-            # 跳过已采集过评论的文章
-            existing = get_comment_count_for_article(db, art_id)
-            if existing > 0:
-                log.info(f"[{i+1}/{len(articles)}] SKIP (has {existing} comments): {art_title[:50]}")
-                # 确保 article_info.comments_count 与实际评论数一致
-                update_comments_count(db, art_id, existing)
-                continue
+            batch_no += 1
+            batch_start = time.time()
+            log.info(
+                f"--- Batch {batch_no}: {len(articles)} articles "
+                f"(total done so far: {stats['done']}) ---"
+            )
 
-            log.info(f"[{i+1}/{len(articles)}] {art_title[:60]}")
+            for i, (art_id, art_title, art_url) in enumerate(articles):
+                log.info(f"[{i+1}/{len(articles)}] {art_title[:60]}")
 
-            # 获取评论
-            comments, total = fetch_all_comments(session, art_id, jwt)
+                # 获取评论
+                comments, total = fetch_all_comments(session, art_id, jwt)
 
-            if not comments:
-                log.info(f"  → 0 comments (API reports {total} total)")
-                stats["no_comments"] += 1
-                # 标记已处理（防止重复查询）
-                update_comments_count(db, art_id, 0)
-                continue
+                if not comments:
+                    log.info(f"  → 0 comments (API reports {total} total)")
+                    stats["no_comments"] += 1
+                    update_comments_count(db, art_id, 0)
+                    continue
 
-            # 保存评论
-            saved = 0
-            affected_users = set()
-            for c in comments:
-                # 先保存评论基本信息
-                if save_comment(db, art_id, c):
-                    saved += 1
+                # 保存评论
+                saved = 0
+                affected_users = set()
+                for c in comments:
+                    if save_comment(db, art_id, c):
+                        saved += 1
 
-                # 同步写入 user_info 和 user_post_info
-                save_user_info(db, c["user_id"], c["user_name"])
-                save_user_post(db, art_id, art_title, c)
-                affected_users.add(c["user_id"])
+                    save_user_info(db, c["user_id"], c["user_name"])
+                    save_user_post(db, art_id, art_title, c)
+                    affected_users.add(c["user_id"])
 
-                # 如果有点赞，尝试获取点赞用户
-                if c["likes"] > 0:
-                    like_uids, like_unms = fetch_comment_like_users(
-                        session, c["comment_id"], art_id, jwt
+                    # 如果有点赞，尝试获取点赞用户
+                    if c["likes"] > 0:
+                        like_uids, like_unms = fetch_comment_like_users(
+                            session, c["comment_id"], art_id, jwt
+                        )
+                        if like_uids:
+                            c["like_user_ids"] = like_uids
+                            c["like_user_names"] = like_unms
+                            save_comment(db, art_id, c)  # 回填
+                            log.debug(f"  +{len(like_uids)} like users for {c['user_name']}")
+                        time.sleep(random.uniform(0.3, 0.8))
+
+                update_comments_count(db, art_id, len(comments))
+
+                if affected_users:
+                    refresh_user_stats(db, list(affected_users))
+
+                stats["done"] += 1
+                stats["total_comments"] += saved
+                log.info(f"  → {saved} comments saved (API reports {total} total)")
+
+                # 定期提交
+                if i > 0 and i % SAVE_INTERVAL == 0:
+                    db.commit()
+                    elapsed = (time.time() - start_time) / 3600
+                    rate = stats["done"] / elapsed if elapsed > 0 else 0
+                    log.info(
+                        f"Progress: {stats['done']} articles, "
+                        f"{stats['total_comments']} comments, "
+                        f"{rate:.0f} articles/hr"
                     )
-                    if like_uids:
-                        c["like_user_ids"] = like_uids
-                        c["like_user_names"] = like_unms
-                        save_comment(db, art_id, c)  # 回填
-                        log.debug(f"  +{len(like_uids)} like users for {c['user_name']}")
-                    time.sleep(random.uniform(0.3, 0.8))
 
-            # 更新评论计数
-            update_comments_count(db, art_id, len(comments))
+                time.sleep(random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX))
 
-            # 刷新本批用户的统计信息
-            if affected_users:
-                refresh_user_stats(db, list(affected_users))
+            db.commit()
 
-            stats["done"] += 1
-            stats["total_comments"] += saved
-            log.info(f"  → {saved} comments saved (API reports {total} total)")
+            batch_elapsed = time.time() - batch_start
+            log.info(
+                f"Batch {batch_no} done in {batch_elapsed:.0f}s. "
+                f"Running totals: {stats['done']} articles, "
+                f"{stats['total_comments']} comments"
+            )
 
-            # 定期提交
-            if i > 0 and i % SAVE_INTERVAL == 0:
-                db.commit()
-                log.info(f"Progress: {stats['done']} articles, {stats['total_comments']} comments")
-
-            # 间隔延迟
-            time.sleep(random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX))
+            # 批次间短暂休息
+            time.sleep(random.uniform(1.0, 3.0))
 
         db.commit()
 
+        elapsed_hr = (time.time() - start_time) / 3600
+        rate = stats["done"] / elapsed_hr if elapsed_hr > 0 else 0
         log.info("=" * 60)
-        log.info(f"Done: {stats['done']} articles, {stats['total_comments']} comments, "
-                 f"{stats['failed']} failed, {stats['no_comments']} no comments")
+        log.info(
+            f"Collection finished! "
+            f"Done: {stats['done']} | "
+            f"Failed: {stats['failed']} | "
+            f"No comments: {stats['no_comments']} | "
+            f"Total comments: {stats['total_comments']} | "
+            f"Time: {elapsed_hr:.1f}h | "
+            f"Avg rate: {rate:.0f} articles/hr"
+        )
         log.info("=" * 60)
+
+    except KeyboardInterrupt:
+        log.info("Interrupted by user. Progress saved.")
+        try:
+            db.commit()
+        except Exception:
+            pass
 
     finally:
         session.close()
