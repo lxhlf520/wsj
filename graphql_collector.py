@@ -263,11 +263,12 @@ def get_pending_count(db) -> int:
     return cnt
 
 
-def save_article_body(db, article_url: str, origin_id: str, title: str,
+def save_article_body(article_url: str, origin_id: str, title: str,
                        author: str, pub_time: str, title_short: str,
                        tag1: str, tag2: str,
                        body_json: str, body_text: str, word_count: int) -> bool:
-    """保存文章正文到 Article_Info"""
+    """保存文章正文到 Article_Info（自动从线程池获取可用连接）"""
+    db = _get_thread_db()
     cur = db.cursor()
     now = datetime.now(timezone.utc).isoformat()
     art_id = origin_id  # 使用 originId 作为主键
@@ -312,8 +313,9 @@ def save_article_body(db, article_url: str, origin_id: str, title: str,
         cur.close()
 
 
-def mark_article_failed(db, article_url: str, reason: str):
-    """标记文章为采集失败，避免无限重试"""
+def mark_article_failed(article_url: str, reason: str):
+    """标记文章为采集失败，避免无限重试（自动从线程池获取可用连接）"""
+    db = _get_thread_db()
     cur = db.cursor()
     now = datetime.now(timezone.utc).isoformat()
     art_id = article_url.split("/")[-1].split("?")[0][:80]
@@ -610,7 +612,6 @@ def _process_one_article(article_url: str, title_hint: str,
                           client_jwt: str, state: CollectorState) -> str:
     """处理单篇文章（线程安全），返回状态字符串"""
     session = _get_thread_session()
-    db = _get_thread_db()
 
     retries = 0
     success = False
@@ -629,7 +630,7 @@ def _process_one_article(article_url: str, title_hint: str,
                     if retries >= MAX_RETRIES:
                         state.inc_meta_failed()
                         state.inc_skipped()
-                        mark_article_failed(db, article_url, "NO_ORIGIN_ID")
+                        mark_article_failed(article_url, "NO_ORIGIN_ID")
                         return "no_origin_id"
                     else:
                         log.warning(f"MetaByUrl failed for {article_url[:80]}, retry {retries}/{MAX_RETRIES}")
@@ -658,7 +659,7 @@ def _process_one_article(article_url: str, title_hint: str,
                     continue
                 elif err == "empty_response":
                     state.inc_skipped()
-                    mark_article_failed(db, article_url, "EMPTY_RESPONSE")
+                    mark_article_failed(article_url, "EMPTY_RESPONSE")
                     return "empty_response"
                 else:
                     log.warning(f"ArticleContent error for {origin_id}: {err}")
@@ -672,13 +673,13 @@ def _process_one_article(article_url: str, title_hint: str,
                 article_type = "NON_TEXT"
                 if body.get("body_items", 0) > 0:
                     article_type = "GALLERY_OR_VIDEO"
-                mark_article_failed(db, article_url, article_type)
+                mark_article_failed(article_url, article_type)
                 state.inc_skipped()
                 return article_type.lower()
 
             # Step 4: 保存
             ok = save_article_body(
-                db, article_url, origin_id,
+                article_url, origin_id,
                 body.get("title", title_hint),
                 body.get("author", ""),
                 body.get("pubTime", ""),
@@ -703,7 +704,7 @@ def _process_one_article(article_url: str, title_hint: str,
 
     if not success and not state.is_auth_expired():
         state.inc_failed()
-        mark_article_failed(db, article_url, "MAX_RETRIES")
+        mark_article_failed(article_url, "MAX_RETRIES")
         return "max_retries"
 
     return "unknown"
