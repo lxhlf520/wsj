@@ -17,6 +17,7 @@
 
 import json
 import os
+import re
 import time
 import random
 import logging
@@ -47,6 +48,18 @@ PROXY = os.environ.get("WSJ_PROXY", "http://127.0.0.1:7890")
 # Apollo Persisted Query Hashes
 HASH_ARTICLE_META_BY_URL = "e36182f1af30342ab15b1cb80595a91da68b0fa62365a5d98781e7b2cb6f4843"
 HASH_ARTICLE_CONTENT = "e03e6948cd028f43cbeac977eb337f719cdd82678e124fef2afec86d9d02d2e7"
+
+# 旧格式 WSJ URL（2010 年以前），ArticleMetaByUrl API 无法解析，跳过 API 调用避免浪费
+_OLD_URL_RE = re.compile(
+    r'(?:/articles/S\d{4,}[A-Z]+$)'      # 短 slug: S50324BENNETT
+    r'|(?:online\.wsj\.com)'            # 旧域名: online.wsj.com/article/...
+    r'|(?:\.html(?:$|\?))'              # 静态 .html 后缀
+)
+
+
+def _is_old_wsj_url(article_url: str) -> bool:
+    """检测是否为现代 GraphQL API 无法解析的旧格式 WSJ URL"""
+    return bool(_OLD_URL_RE.search(article_url))
 
 # 请求头模板
 BASE_HEADERS = {
@@ -622,6 +635,13 @@ def _process_one_article(article_url: str, title_hint: str,
             return "auth_expired"
 
         try:
+            # Step 0: 旧格式 URL 预判（API 无法解析，跳过避免浪费 API 调用）
+            if origin_id is None and _is_old_wsj_url(article_url):
+                state.inc_meta_failed()
+                state.inc_skipped()
+                mark_article_failed(article_url, "NO_ORIGIN_ID")
+                return "no_origin_id"
+
             # Step 1: URL → originId (支持重试)
             if origin_id is None:
                 origin_id = url_to_origin_id(session, article_url)
