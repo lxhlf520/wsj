@@ -124,7 +124,7 @@ def claim_articles_for_comments(db, limit: int) -> list:
               AND Art_ID IS NOT NULL
               AND Art_ID != ''
               AND (Art_ID LIKE 'WP-WSJ-%%' OR Art_ID LIKE 'SB%%')
-              AND Comments_Count IS NULL
+              AND Comments_Count = 0
             ORDER BY scrape_time ASC
             LIMIT %s
             FOR UPDATE SKIP LOCKED
@@ -138,10 +138,10 @@ def claim_articles_for_comments(db, limit: int) -> list:
 
 
 def reset_stale_comment_claims(db):
-    """启动时重置崩溃残留的处理中标记（Comments_Count = -1 → NULL）"""
+    """启动时重置崩溃残留的处理中标记（Comments_Count = -1 → 0）"""
     cur = db.cursor()
     cur.execute(
-        "UPDATE Article_Info SET Comments_Count = NULL WHERE Comments_Count = -1"
+        "UPDATE Article_Info SET Comments_Count = 0 WHERE Comments_Count = -1"
     )
     n = cur.rowcount
     if n > 0:
