@@ -103,6 +103,25 @@ def get_db():
     return psycopg2.connect(**PG_CONFIG)
 
 
+def _ensure_db_alive(db):
+    """检查连接是否存活，死掉则自动重连
+
+    HTTP 请求期间（Spot.IM API 每次 1-2s）PostgreSQL 可能主动断开空闲连接，
+    每次 DB 写操作前调用此函数确保连接可用。
+    """
+    try:
+        cur = db.cursor()
+        cur.execute("SELECT 1")
+        cur.close()
+        return db
+    except Exception:
+        try:
+            db.close()
+        except Exception:
+            pass
+        return get_db()
+
+
 def claim_articles_for_comments(db, limit: int) -> list:
     """原子认领待采集评论的文章（多实例分布式安全）
 
@@ -210,16 +229,18 @@ def save_comment(db, art_id: str, comment: dict) -> bool:
 
 def update_comments_count(db, art_id: str, count: int):
     """更新 article_info 中的评论数"""
-    cur = db.cursor()
     try:
+        cur = db.cursor()
         cur.execute("UPDATE Article_Info SET Comments_Count = %s WHERE Art_ID = %s",
                     (count, art_id))
         db.commit()
-    except Exception as e:
-        db.rollback()
-        log.warning(f"update_comments_count error: {e}")
-    finally:
         cur.close()
+    except Exception as e:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        log.warning(f"update_comments_count error for {art_id}: {e}")
 
 
 def save_user_info(db, user_id: str, user_nm: str):
@@ -772,6 +793,9 @@ def run(max_articles: int = None):
                 # 获取评论
                 comments, total = fetch_all_comments(session, art_id, jwt)
 
+                # API 调用期间 PG 可能断开空闲连接，写入前自检重连
+                db = _ensure_db_alive(db)
+
                 if not comments:
                     log.info(f"  → 0 comments (API reports {total} total)")
                     stats["no_comments"] += 1
@@ -794,6 +818,7 @@ def run(max_articles: int = None):
                         like_uids, like_unms = fetch_comment_like_users(
                             session, c["comment_id"], art_id, jwt
                         )
+                        db = _ensure_db_alive(db)
                         if like_uids:
                             c["like_user_ids"] = like_uids
                             c["like_user_names"] = like_unms
