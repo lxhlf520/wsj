@@ -152,8 +152,8 @@ def claim_articles_for_comments(db, limit: int) -> list:
               AND Art_ID != ''
               AND (Art_ID LIKE 'WP-WSJ-%%' OR Art_ID LIKE 'SB%%')
               AND Comments_Count = 0
-              -- Spot.IM 约 2017 年接入 WSJ；早于此时的文章不用浪费 API 调用
-              AND (Art_Time = '' OR Art_Time ~ '20(1[7-9]|2\\d)')
+              -- Spot.IM 约 2015 年接入 WSJ；早于此时的文章不用浪费 API 调用
+              AND (Art_Time = '' OR Art_Time ~ '20(1[5-9]|2\\d)')
             ORDER BY scrape_time ASC
             LIMIT %s
             FOR UPDATE SKIP LOCKED
