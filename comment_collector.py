@@ -56,6 +56,13 @@ SAVE_INTERVAL = 10
 MAX_RETRIES = 3
 COMMENT_PAGE_SIZE = 50  # 每页评论数
 
+# Comments_Count 状态约定：
+#   0   = 未处理（可认领）
+#   -1  = 处理中（已认领，崩溃后由 reset_stale_comment_claims 恢复为 0）
+#   -2  = 已确认无评论（Spot.IM 返回 0 条，永久跳过，不再重复调 API）
+#   >0  = 已采集到 N 条评论
+NO_COMMENTS = -2
+
 # 日志
 LOG_FILE = Path(__file__).parent / "comment_collector.log"
 logging.basicConfig(
@@ -130,7 +137,8 @@ def claim_articles_for_comments(db, limit: int) -> list:
     Comments_Count = -1 表示「处理中」，防止其他实例重复认领；
     处理完后由 update_comments_count() 改回真实值。
 
-    启动时 reset_stale_comment_claims() 会把崩溃残留的 -1 重置为 NULL。
+    启动时 reset_stale_comment_claims() 会把崩溃残留的 -1 重置为 0。
+    Comments_Count = -2 的文章（已确认无评论）不会被重新认领。
     """
     cur = db.cursor()
     cur.execute("""
@@ -584,23 +592,29 @@ def fetch_all_comments(
     session: httpx.Client,
     post_id: str,
     jwt: str,
-) -> tuple[list[dict], int]:
+) -> tuple[list[dict], int, Optional[str]]:
     """获取文章的全部评论（自动翻页）
 
     Returns:
-        (comments_list, total_messages_count)
+        (comments_list, total_messages_count, error)
+        error 为 None 表示首页请求成功（即使 messages_count = 0）；
+        否则为错误标识（auth_expired / rate_limited / http_XXX / network），
+        用于区分「确认无评论」与「请求失败需重试」。
     """
     all_comments: dict[str, dict] = {}  # comment_id → comment
     total = 0
     offset = 0
+    error: Optional[str] = None
     max_pages = 60  # 安全上限：3000 条
 
     for page in range(max_pages):
         data = fetch_conversation_page(session, post_id, jwt, offset=offset)
 
         if not data:
+            error = "network"
             break
         if "error" in data:
+            error = data["error"]
             log.warning(f"Page {page} error: {data['error']}")
             break
 
@@ -624,7 +638,7 @@ def fetch_all_comments(
         # 翻页延迟
         time.sleep(random.uniform(0.2, 0.5))
 
-    return list(all_comments.values()), total
+    return list(all_comments.values()), total, error
 
 
 # ============================================================
@@ -791,16 +805,27 @@ def run(max_articles: int = None):
                 log.info(f"[{i+1}/{len(articles)}] {art_title[:60]}")
 
                 # 获取评论
-                comments, total = fetch_all_comments(session, art_id, jwt)
+                comments, total, err = fetch_all_comments(session, art_id, jwt)
 
                 # API 调用期间 PG 可能断开空闲连接，写入前自检重连
                 db = _ensure_db_alive(db)
 
-                if not comments:
-                    log.info(f"  → 0 comments (API reports {total} total)")
-                    stats["no_comments"] += 1
+                if err and not comments:
+                    # 请求失败（限流/网络等）：恢复为待采集，下次重试，不标记跳过
+                    log.warning(f"  → API error ({err}), keep for retry")
+                    stats["failed"] += 1
                     update_comments_count(db, art_id, 0)
                     continue
+
+                if not comments:
+                    # API 确认 0 评论：标记 NO_COMMENTS，永久跳过，不再重复调 API
+                    log.info(f"  → 0 comments (API reports {total} total)")
+                    stats["no_comments"] += 1
+                    update_comments_count(db, art_id, NO_COMMENTS)
+                    continue
+
+                if err:
+                    log.warning(f"  → partial: page error ({err}), saved {len(comments)} comments")
 
                 # 保存评论
                 saved = 0

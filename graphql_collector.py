@@ -306,9 +306,13 @@ def save_article_body(article_url: str, origin_id: str, title: str,
         """, (art_id, title, title_short, author, pub_time,
               tag1, tag2, article_url, body_text, body_json, now))
         # 从 comment_info 同步 comments_count，防止因 article_info 重建导致计数丢失
+        # 负数保留：-1 = 评论采集中，-2 = 已确认无评论（评论采集器状态标记）
         cur.execute("""
             UPDATE Article_Info
-            SET comments_count = (SELECT COUNT(*) FROM comment_info WHERE article_id = %s)
+            SET comments_count = CASE
+                WHEN comments_count < 0 THEN comments_count
+                ELSE (SELECT COUNT(*) FROM comment_info WHERE article_id = %s)
+            END
             WHERE art_id = %s
         """, (art_id, art_id))
         cur.execute("RELEASE SAVEPOINT sp_save")

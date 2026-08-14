@@ -50,7 +50,7 @@ def main():
 
             with_c, total_c = 0, 0
             for aid in ids:
-                comments, total = fetch_all_comments(session, aid, jwt)
+                comments, total, _err = fetch_all_comments(session, aid, jwt)
                 if comments:
                     with_c += 1
                 total_c += total or 0
