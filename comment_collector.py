@@ -26,6 +26,9 @@ from typing import Optional
 import httpx
 import psycopg2
 
+# Spot.IM JWT 自动续期（CDP 从登录态 Chrome 抓 widget token）
+from spotim_refresh import refresh_spotim_jwt, jwt_remaining_seconds, REFRESH_MARGIN_SEC
+
 # ============================================================
 # 配置
 # ============================================================
@@ -397,6 +400,8 @@ def fetch_conversation_page(
     """
     headers = BASE_HEADERS.copy()
     headers["authorization"] = f"Bearer {jwt}"
+    # Web widget 来源的 token 走 x-access-token 头，两种都带上兼容不同签发路径
+    headers["x-access-token"] = jwt
     headers["x-post-id"] = post_id
 
     body = {
@@ -457,6 +462,8 @@ def fetch_comment_like_users(
     """
     headers = BASE_HEADERS.copy()
     headers["authorization"] = f"Bearer {jwt}"
+    # Web widget 来源的 token 走 x-access-token 头，两种都带上兼容不同签发路径
+    headers["x-access-token"] = jwt
     headers["x-post-id"] = post_id
 
     all_user_ids: list[str] = []
@@ -761,10 +768,13 @@ def run(max_articles: int = None):
     log.info("WSJ Spot.im Comment Collector (APP API)")
     log.info("=" * 60)
 
-    # 加载 JWT
+    # 加载 JWT；缺失/过期时尝试 CDP 自动提取（调试 Chrome 登录态）
     jwt = load_spotim_jwt()
     if not jwt:
-        log.error("No valid Spot.im JWT found. Run _extract_spotim_jwt.py first.")
+        log.info("Spot.im JWT missing/expired, trying CDP auto-extraction...")
+        jwt = refresh_spotim_jwt()
+    if not jwt:
+        log.error("No valid Spot.im JWT found and CDP extraction failed.")
         return
 
     db = get_db()
@@ -784,6 +794,15 @@ def run(max_articles: int = None):
             if max_articles and stats["done"] >= max_articles:
                 log.info(f"Reached max_articles limit ({max_articles}), stopping.")
                 break
+
+            # Spot.im token 约 1 小时有效：余量不足时 CDP 自动续期，无需人工换 token
+            if jwt_remaining_seconds(jwt) < REFRESH_MARGIN_SEC:
+                new_jwt = refresh_spotim_jwt()
+                if new_jwt:
+                    jwt = new_jwt
+                    log.info("Spot.im JWT auto-refreshed via CDP")
+                else:
+                    log.warning("Spot.im JWT auto-refresh failed, keeping current token")
 
             # 本批认领量：不超过剩余配额（如果有上限）
             claim_limit = BATCH_SIZE
@@ -814,11 +833,19 @@ def run(max_articles: int = None):
 
                 # JWT 失效熔断：连续 5 篇 auth_expired 立即停止，避免空转遍历全部文章
                 if err == "auth_expired":
+                    # 先尝试立即续期一次（余量检查可能漏掉），成功则本篇重新入队
+                    new_jwt = refresh_spotim_jwt()
+                    if new_jwt and new_jwt != jwt:
+                        jwt = new_jwt
+                        consecutive_auth_errors = 0
+                        update_comments_count(db, art_id, 0)
+                        log.info("  → JWT refreshed via CDP, article re-queued")
+                        continue
                     consecutive_auth_errors += 1
                     if consecutive_auth_errors >= 5:
                         log.error(
-                            "Spot.im JWT 已失效（连续 5 篇 auth_expired），停止采集。"
-                            "请重新抓包更新 spotim_jwt.txt 后重启。"
+                            "Spot.im JWT 已失效（连续 5 篇 auth_expired 且 CDP 续期失败），停止采集。"
+                            "确认调试 Chrome 已登录 WSJ 后重启，或手动更新 spotim_jwt.txt。"
                         )
                         auth_dead = True
                         break
