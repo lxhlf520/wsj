@@ -138,7 +138,12 @@ def _pump_token(client: CDPClient, seconds: float) -> Optional[str]:
 def extract_spotim_jwt_via_cdp() -> Optional[str]:
     """CDP 提取 Spot.IM JWT：新 tab → 文章页 → 触发 widget → 抓请求头 → 验证"""
     try:
-        tab = _http(f"{CDP_HOST}/json/new?url=about:blank").json()
+        # 新版 Chrome 的 /json/new 只接受 PUT（GET 返回 405），旧版两者皆可
+        url = f"{CDP_HOST}/json/new?url=about:blank"
+        r = httpx.request("PUT", url, timeout=10, trust_env=False)
+        if r.status_code in (400, 405):
+            r = httpx.get(url, timeout=10, trust_env=False)
+        tab = r.json()
     except Exception as e:
         log.error(f"CDP new tab failed: {e}")
         return None

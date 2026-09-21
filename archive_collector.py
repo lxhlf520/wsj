@@ -418,8 +418,10 @@ def get_or_create_page() -> tuple[Optional[str], str]:
             url = p.get("url", "")
             if p.get("type") == "page" and ("wsj.com" in url or "blank" in url or "newtab" in url or url == "about:blank"):
                 return p["webSocketDebuggerUrl"], url
-        # 创建新页面
-        r2 = httpx.get(f"{CDP_HOST}/json/new?url=", timeout=5, trust_env=False)
+        # 创建新页面（新版 Chrome 的 /json/new 只接受 PUT，GET 返回 405）
+        r2 = httpx.request("PUT", f"{CDP_HOST}/json/new?url=", timeout=5, trust_env=False)
+        if r2.status_code in (400, 405):
+            r2 = httpx.get(f"{CDP_HOST}/json/new?url=", timeout=5, trust_env=False)
         new_page = r2.json()
         return new_page["webSocketDebuggerUrl"], "about:blank"
     except Exception as e:
