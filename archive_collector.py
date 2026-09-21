@@ -410,15 +410,16 @@ class CDPClient:
 
 def get_or_create_page() -> tuple[Optional[str], str]:
     """获取或创建 CDP 页面，返回 (ws_url, page_url)"""
+    # CDP 是纯本地通信，trust_env=False 防止被 HTTP_PROXY 环境变量劫持到代理（表现为 502 Bad Gateway）
     try:
-        r = httpx.get(f"{CDP_HOST}/json/list", timeout=5)
+        r = httpx.get(f"{CDP_HOST}/json/list", timeout=5, trust_env=False)
         pages = r.json()
         for p in pages:
             url = p.get("url", "")
             if p.get("type") == "page" and ("wsj.com" in url or "blank" in url or "newtab" in url or url == "about:blank"):
                 return p["webSocketDebuggerUrl"], url
         # 创建新页面
-        r2 = httpx.get(f"{CDP_HOST}/json/new?url=", timeout=5)
+        r2 = httpx.get(f"{CDP_HOST}/json/new?url=", timeout=5, trust_env=False)
         new_page = r2.json()
         return new_page["webSocketDebuggerUrl"], "about:blank"
     except Exception as e:
