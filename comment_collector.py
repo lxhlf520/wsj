@@ -776,6 +776,7 @@ def run(max_articles: int = None):
     stats = {"done": 0, "failed": 0, "no_comments": 0, "total_comments": 0}
     batch_no = 0
     start_time = time.time()
+    consecutive_auth_errors = 0  # 连续 auth_expired 计数，用于 JWT 失效熔断
 
     try:
         while True:
@@ -801,6 +802,7 @@ def run(max_articles: int = None):
                 f"(total done so far: {stats['done']}) ---"
             )
 
+            auth_dead = False
             for i, (art_id, art_title, art_url) in enumerate(articles):
                 log.info(f"[{i+1}/{len(articles)}] {art_title[:60]}")
 
@@ -809,6 +811,19 @@ def run(max_articles: int = None):
 
                 # API 调用期间 PG 可能断开空闲连接，写入前自检重连
                 db = _ensure_db_alive(db)
+
+                # JWT 失效熔断：连续 5 篇 auth_expired 立即停止，避免空转遍历全部文章
+                if err == "auth_expired":
+                    consecutive_auth_errors += 1
+                    if consecutive_auth_errors >= 5:
+                        log.error(
+                            "Spot.im JWT 已失效（连续 5 篇 auth_expired），停止采集。"
+                            "请重新抓包更新 spotim_jwt.txt 后重启。"
+                        )
+                        auth_dead = True
+                        break
+                elif err is None:
+                    consecutive_auth_errors = 0
 
                 if err and not comments:
                     # 请求失败（限流/网络等）：恢复为待采集，下次重试，不标记跳过
@@ -874,6 +889,9 @@ def run(max_articles: int = None):
                 time.sleep(random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX))
 
             db.commit()
+
+            if auth_dead:
+                break
 
             batch_elapsed = time.time() - batch_start
             log.info(
