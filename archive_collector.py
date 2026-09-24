@@ -375,6 +375,7 @@ class CDPClient:
     def evaluate(self, expression: str, timeout: int = 15) -> Optional[str]:
         result = self.send_and_wait("Runtime.evaluate", {
             "returnByValue": True,
+            "awaitPromise": True,  # 支持 async IIFE，否则 Promise 被序列化成 {}
             "expression": expression,
         }, timeout=timeout)
         if result and "result" in result:
@@ -1100,8 +1101,8 @@ def run_login(timeout_minutes: int = 5):
             return 'logged_in_via_ui';
         }
         const cookies = document.cookie || '';
-        // 已登录的 WSJ cookie 名称
-        if (/dj_s|wsj_uuid|connect\\.sid|ab_uuid|client_jwt/.test(cookies)) {
+        // 已登录的 WSJ cookie 名称（ab_uuid/wsj_uuid 是所有访客都有的，不能作为登录依据）
+        if (/dj_s|connect\\.sid|ca_rt|client_jwt/.test(cookies)) {
             return 'logged_in_via_cookie: ' + cookies.substring(0, 200);
         }
         return null;
@@ -1166,7 +1167,8 @@ def run_jwt_via_cdp():
     time.sleep(2)
     check_js = """(() => {
         const cookies = document.cookie || '';
-        if (/dj_s|connect\\.sid|ab_uuid|client_jwt|wsj_uuid/.test(cookies)) {
+        // 只认真实会话 cookie（ab_uuid/wsj_uuid 访客也有，会误报）
+        if (/dj_s|connect\\.sid|ca_rt|client_jwt/.test(cookies)) {
             return 'has_cookies';
         }
         return null;

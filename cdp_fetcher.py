@@ -49,6 +49,7 @@ class CDPClient:
         """在页面执行 JavaScript 并返回结果"""
         result = self.send_and_wait("Runtime.evaluate", {
             "returnByValue": True,
+            "awaitPromise": True,  # 支持 async IIFE，否则 Promise 被序列化成 {}
             "expression": expression,
         }, timeout=timeout)
         if result:
