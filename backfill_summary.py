@@ -44,7 +44,7 @@ def main():
             SELECT art_id, art_text, art_text_html FROM Article_Info
             WHERE art_id > %s
               AND art_text_html IS NOT NULL
-              AND art_text NOT LIKE 'Quick Summary:%%'
+              AND (art_text IS NULL OR art_text NOT LIKE 'Quick Summary:%%')
             ORDER BY art_id
             LIMIT %s
             """,
