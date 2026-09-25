@@ -393,6 +393,28 @@ def url_to_origin_id(session: httpx.Client, article_url: str) -> Optional[str]:
         return None
 
 
+def extract_quick_summary(article: dict) -> list:
+    """从 ArticleContent 响应抽 AI Quick Summary 的 bullet 列表
+
+    判据：flattenedAltSummaries 中 list 非空的条目（SEO/Social 空壳 list 为 null），
+    其 list.listContent[].textAndDecorations.flattened.text 即页面上的摘要条目。
+    """
+    bullets = []
+    for s in (article.get("flattenedAltSummaries") or []):
+        if not isinstance(s, dict):
+            continue
+        lst = s.get("list")
+        if not isinstance(lst, dict):
+            continue
+        for lc in (lst.get("listContent") or []):
+            if not isinstance(lc, dict):
+                continue
+            t = ((lc.get("textAndDecorations") or {}).get("flattened") or {}).get("text", "")
+            if isinstance(t, str) and t.strip():
+                bullets.append(t.strip())
+    return bullets
+
+
 def fetch_article_body(session: httpx.Client, origin_id: str, client_jwt: str) -> Optional[dict]:
     """通过 ArticleContent 获取文章正文（需要 Client JWT）"""
     headers = BASE_HEADERS.copy()
@@ -517,8 +539,14 @@ def fetch_article_body(session: httpx.Client, origin_id: str, client_jwt: str) -
             elif typename in ("GalleryArticleBody", "VideoArticleBody", "SlideshowArticleBody"):
                 pass  # 这些类型没有文本内容
 
-        result["text"] = "\n\n".join(paragraphs)
-        result["word_count"] = len(result["text"].split()) if result["text"] else 0
+        text = "\n\n".join(paragraphs)
+        # AI Quick Summary 拼在正文前（与页面呈现顺序一致）
+        summary_bullets = extract_quick_summary(article)
+        if summary_bullets:
+            block = "Quick Summary:\n" + "\n".join(f"- {b}" for b in summary_bullets)
+            text = (block + "\n\n" + text) if text else block
+        result["text"] = text
+        result["word_count"] = len(text.split()) if text else 0
         result["has_paragraph"] = has_paragraph
 
         return result
